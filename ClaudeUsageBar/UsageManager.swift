@@ -9,6 +9,7 @@ final class UsageManager: ObservableObject {
 
     private var timer: Timer?
     private let refreshInterval: TimeInterval = 300 // 5 minutes
+    private var cachedToken: String?
 
     init() {
         Task { [weak self] in
@@ -28,12 +29,29 @@ final class UsageManager: ObservableObject {
 
     func refresh() async {
         do {
-            let token = try KeychainHelper.readOAuthToken()
+            // Use cached token if available to avoid keychain password prompts
+            if cachedToken == nil {
+                cachedToken = try KeychainHelper.readOAuthToken()
+            }
+            let token = cachedToken!
             let data = try await fetchUsage(token: token)
             let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
             self.usage = decoded
             self.errorMessage = nil
             self.lastUpdated = Date()
+        } catch let error as URLError where error.code == .userAuthenticationRequired {
+            // Token may have been rotated — clear cache and retry once
+            cachedToken = nil
+            do {
+                cachedToken = try KeychainHelper.readOAuthToken()
+                let data = try await fetchUsage(token: cachedToken!)
+                let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
+                self.usage = decoded
+                self.errorMessage = nil
+                self.lastUpdated = Date()
+            } catch {
+                self.errorMessage = error.localizedDescription
+            }
         } catch {
             self.errorMessage = error.localizedDescription
         }
@@ -55,6 +73,9 @@ final class UsageManager: ObservableObject {
         let (data, response) = try await URLSession.shared.data(for: request)
 
         if let httpResponse = response as? HTTPURLResponse, !(200...299).contains(httpResponse.statusCode) {
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                throw URLError(.userAuthenticationRequired)
+            }
             throw URLError(.badServerResponse)
         }
 
