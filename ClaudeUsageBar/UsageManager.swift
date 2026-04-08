@@ -10,6 +10,7 @@ final class UsageManager: ObservableObject {
     private var timer: Timer?
     private let refreshInterval: TimeInterval = 300 // 5 minutes
     private var cachedToken: String?
+    private var claudeVersion: String = "2.0.31"
 
     init() {
         Task { [weak self] in
@@ -28,6 +29,7 @@ final class UsageManager: ObservableObject {
     }
 
     func refresh() async {
+        claudeVersion = detectClaudeCodeVersion() ?? "2.0.31"
         do {
             // Use cached token if available to avoid keychain password prompts
             if cachedToken == nil {
@@ -66,7 +68,7 @@ final class UsageManager: ObservableObject {
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("claude-code/2.0.31", forHTTPHeaderField: "User-Agent")
+        request.setValue("claude-code/\(claudeVersion)", forHTTPHeaderField: "User-Agent")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
 
@@ -118,6 +120,34 @@ final class UsageManager: ObservableObject {
         if let h = diff.hour, h > 0 { parts.append("\(h)h") }
         if let m = diff.minute, m > 0 { parts.append("\(m)m") }
         return parts.isEmpty ? "soon" : "resets in \(parts.joined(separator: " "))"
+    }
+
+    private nonisolated func detectClaudeCodeVersion() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["claude", "--version"]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else { return nil }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return nil }
+
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let match = trimmed.range(of: #"\d+\.\d+\.\d+"#, options: .regularExpression) {
+            return String(trimmed[match])
+        }
+        return nil
     }
 
     private func parseISO8601(_ str: String) -> Date? {
