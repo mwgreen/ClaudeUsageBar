@@ -1,6 +1,18 @@
 import Foundation
 import Combine
 
+enum APIError: LocalizedError {
+    case httpError(statusCode: Int, body: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .httpError(let statusCode, let body):
+            let truncated = body.count > 200 ? String(body.prefix(200)) + "…" : body
+            return "HTTP \(statusCode): \(truncated)"
+        }
+    }
+}
+
 @MainActor
 final class UsageManager: ObservableObject {
     @Published var usage: UsageResponse?
@@ -78,7 +90,8 @@ final class UsageManager: ObservableObject {
             if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
                 throw URLError(.userAuthenticationRequired)
             }
-            throw URLError(.badServerResponse)
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw APIError.httpError(statusCode: httpResponse.statusCode, body: body)
         }
 
         return data
