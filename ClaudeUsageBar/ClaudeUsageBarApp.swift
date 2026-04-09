@@ -23,7 +23,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusItem()
 
         usageManager.$usage
-            .combineLatest(usageManager.$errorMessage)
+            .combineLatest(usageManager.$errorMessage, usageManager.$lastUpdated)
+            .combineLatest(usageManager.$isStale)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _, _ in
                 self?.updateStatusItem()
@@ -43,6 +44,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let item = NSMenuItem(title: "Error: \(error)", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
+        }
+
+        if usageManager.isStale {
+            let staleItem = NSMenuItem(title: "Stale data (updated \(usageManager.lastUpdatedText), rate limited)", action: nil, keyEquivalent: "")
+            staleItem.isEnabled = false
+            menu.addItem(staleItem)
         }
 
         if let usage = usageManager.usage {
@@ -68,6 +75,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             item.isEnabled = false
             menu.addItem(item)
         }
+
+        menu.addItem(NSMenuItem.separator())
+
+        let updatedItem = NSMenuItem(title: "Last updated: \(usageManager.lastUpdatedText)", action: nil, keyEquivalent: "")
+        updatedItem.isEnabled = false
+        menu.addItem(updatedItem)
 
         menu.addItem(NSMenuItem.separator())
 

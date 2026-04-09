@@ -2,10 +2,13 @@ import Foundation
 import Combine
 
 enum APIError: LocalizedError {
+    case rateLimited
     case httpError(statusCode: Int, body: String)
 
     var errorDescription: String? {
         switch self {
+        case .rateLimited:
+            return "Rate limited (429)"
         case .httpError(let statusCode, let body):
             let truncated = body.count > 200 ? String(body.prefix(200)) + "…" : body
             return "HTTP \(statusCode): \(truncated)"
@@ -18,11 +21,14 @@ final class UsageManager: ObservableObject {
     @Published var usage: UsageResponse?
     @Published var errorMessage: String?
     @Published var lastUpdated: Date?
+    @Published var isStale: Bool = false
 
     private var timer: Timer?
     private let refreshInterval: TimeInterval = 300 // 5 minutes
     private var cachedToken: String?
     private var claudeVersion: String = "2.0.31"
+    private var consecutiveFailures: Int = 0
+    private let maxFailuresBeforeStale: Int = 3 // ~15 min at 5-min intervals
 
     init() {
         Task { [weak self] in
@@ -53,6 +59,8 @@ final class UsageManager: ObservableObject {
             self.usage = decoded
             self.errorMessage = nil
             self.lastUpdated = Date()
+            self.consecutiveFailures = 0
+            self.isStale = false
         } catch let error as URLError where error.code == .userAuthenticationRequired {
             // Token may have been rotated — clear cache and retry once
             cachedToken = nil
@@ -63,11 +71,38 @@ final class UsageManager: ObservableObject {
                 self.usage = decoded
                 self.errorMessage = nil
                 self.lastUpdated = Date()
+                self.consecutiveFailures = 0
+                self.isStale = false
             } catch {
-                self.errorMessage = error.localizedDescription
+                handleRefreshFailure(error: error)
             }
         } catch {
-            self.errorMessage = error.localizedDescription
+            handleRefreshFailure(error: error)
+        }
+    }
+
+    private func handleRefreshFailure(error: Error) {
+        // 429 is a known server-side issue — keep showing last-known data as stale
+        if let apiError = error as? APIError, case .rateLimited = apiError {
+            if usage != nil {
+                self.isStale = true
+                self.errorMessage = nil // cached data IS the display, not an error
+            }
+            return
+        }
+
+        consecutiveFailures += 1
+        self.errorMessage = error.localizedDescription
+
+        // After repeated failures, clear stale usage data so menu bar shows ⚪ --
+        if consecutiveFailures >= maxFailuresBeforeStale {
+            self.usage = nil
+            self.isStale = false
+        }
+
+        // Force token refresh on persistent errors (not just 401/403)
+        if consecutiveFailures >= 2 {
+            cachedToken = nil
         }
     }
 
@@ -90,6 +125,9 @@ final class UsageManager: ObservableObject {
             if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
                 throw URLError(.userAuthenticationRequired)
             }
+            if httpResponse.statusCode == 429 {
+                throw APIError.rateLimited
+            }
             let body = String(data: data, encoding: .utf8) ?? ""
             throw APIError.httpError(statusCode: httpResponse.statusCode, body: body)
         }
@@ -109,7 +147,8 @@ final class UsageManager: ObservableObject {
         let h5 = Int(usage.fiveHour.utilization.rounded())
         let d7 = Int(usage.sevenDay.utilization.rounded())
         let dot = colorDot(for: max(usage.fiveHour.utilization, usage.sevenDay.utilization))
-        return "\(dot) 5h: \(h5)% | 7d: \(d7)%"
+        let staleIndicator = isStale ? " \u{29D6}" : ""
+        return "\(dot) 5h: \(h5)% | 7d: \(d7)%\(staleIndicator)"
     }
 
     func colorDot(for utilization: Double) -> String {
@@ -118,6 +157,16 @@ final class UsageManager: ObservableObject {
         case 50..<80: return "\u{1F7E1}" // yellow circle
         default: return "\u{1F534}"      // red circle
         }
+    }
+
+    var lastUpdatedText: String {
+        guard let lastUpdated else { return "Never" }
+        let elapsed = Date().timeIntervalSince(lastUpdated)
+        if elapsed < 60 { return "Just now" }
+        let minutes = Int(elapsed / 60)
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        return "\(hours)h \(minutes % 60)m ago"
     }
 
     func relativeReset(from isoString: String?) -> String {
