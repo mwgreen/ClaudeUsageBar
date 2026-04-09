@@ -38,7 +38,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func buildMenu() {
-        let menu = NSMenu()
+        let menu = statusItem.menu ?? NSMenu()
+        menu.removeAllItems()
 
         if let error = usageManager.errorMessage {
             let item = NSMenuItem(title: "Error: \(error)", action: nil, keyEquivalent: "")
