@@ -82,16 +82,21 @@ final class UsageManager: ObservableObject {
     }
 
     private func handleRefreshFailure(error: Error) {
+        consecutiveFailures += 1
+
         // 429 is a known server-side issue — keep showing last-known data as stale
         if let apiError = error as? APIError, case .rateLimited = apiError {
             if usage != nil {
                 self.isStale = true
                 self.errorMessage = nil // cached data IS the display, not an error
             }
+            // After repeated 429s, clear token in case it's expired/invalid
+            if consecutiveFailures >= 2 {
+                cachedToken = nil
+            }
             return
         }
 
-        consecutiveFailures += 1
         self.errorMessage = error.localizedDescription
 
         // After repeated failures, clear stale usage data so menu bar shows ⚪ --
