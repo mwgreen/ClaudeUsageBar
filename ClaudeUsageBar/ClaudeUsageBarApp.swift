@@ -1,74 +1,107 @@
-import SwiftUI
+import Cocoa
+import Combine
 import ServiceManagement
 
 @main
-struct ClaudeUsageBarApp: App {
-    @StateObject private var usageManager = UsageManager()
+@MainActor
+class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem!
+    private var usageManager: UsageManager!
+    private var cancellables = Set<AnyCancellable>()
 
-    var body: some Scene {
-        MenuBarExtra {
-            MenuContent(usageManager: usageManager)
-        } label: {
-            Text(usageManager.menuBarText)
-        }
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
     }
-}
 
-struct LaunchAtLoginToggle: View {
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        usageManager = UsageManager()
 
-    var body: some View {
-        Toggle("Launch at Login", isOn: $launchAtLogin)
-            .onChange(of: launchAtLogin) { newValue in
-                do {
-                    if newValue {
-                        try SMAppService.mainApp.register()
-                    } else {
-                        try SMAppService.mainApp.unregister()
-                    }
-                } catch {
-                    launchAtLogin = SMAppService.mainApp.status == .enabled
-                }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        updateStatusItem()
+
+        usageManager.$usage
+            .combineLatest(usageManager.$errorMessage)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _, _ in
+                self?.updateStatusItem()
             }
+            .store(in: &cancellables)
     }
-}
 
-struct MenuContent: View {
-    @ObservedObject var usageManager: UsageManager
+    private func updateStatusItem() {
+        statusItem.button?.title = usageManager.menuBarText
+        buildMenu()
+    }
 
-    var body: some View {
+    private func buildMenu() {
+        let menu = NSMenu()
+
         if let error = usageManager.errorMessage {
-            Text("Error: \(error)")
-                .foregroundColor(.red)
+            let item = NSMenuItem(title: "Error: \(error)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
         }
 
         if let usage = usageManager.usage {
             let h5 = Int(usage.fiveHour.utilization.rounded())
             let d7 = Int(usage.sevenDay.utilization.rounded())
 
-            Text("5-hour session: \(h5)% \u{2014} \(usageManager.relativeReset(from: usage.fiveHour.resetsAt))")
-            Text("7-day weekly: \(d7)% \u{2014} \(usageManager.relativeReset(from: usage.sevenDay.resetsAt))")
+            let h5Item = NSMenuItem(title: "5-hour session: \(h5)% \u{2014} \(usageManager.relativeReset(from: usage.fiveHour.resetsAt))", action: nil, keyEquivalent: "")
+            h5Item.isEnabled = false
+            menu.addItem(h5Item)
+
+            let d7Item = NSMenuItem(title: "7-day weekly: \(d7)% \u{2014} \(usageManager.relativeReset(from: usage.sevenDay.resetsAt))", action: nil, keyEquivalent: "")
+            d7Item.isEnabled = false
+            menu.addItem(d7Item)
 
             if let opus = usage.sevenDayOpus, opus.utilization > 0 {
                 let opusVal = Int(opus.utilization.rounded())
-                Text("7-day Opus: \(opusVal)%")
+                let opusItem = NSMenuItem(title: "7-day Opus: \(opusVal)%", action: nil, keyEquivalent: "")
+                opusItem.isEnabled = false
+                menu.addItem(opusItem)
             }
         } else if usageManager.errorMessage == nil {
-            Text("Loading...")
+            let item = NSMenuItem(title: "Loading...", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
         }
 
-        Divider()
+        menu.addItem(NSMenuItem.separator())
 
-        LaunchAtLoginToggle()
+        let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
+        launchItem.target = self
+        launchItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(launchItem)
 
-        Button("Refresh Now") {
-            Task { await usageManager.refresh() }
-        }
-        .keyboardShortcut("r")
+        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
+        refreshItem.target = self
+        menu.addItem(refreshItem)
 
-        Button("Quit") {
-            NSApplication.shared.terminate(nil)
-        }
-        .keyboardShortcut("q")
+        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem.menu = menu
+    }
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {}
+    }
+
+    @objc private func refreshNow() {
+        Task { await usageManager.refresh() }
+    }
+
+    @objc private func quit() {
+        NSApplication.shared.terminate(nil)
     }
 }
