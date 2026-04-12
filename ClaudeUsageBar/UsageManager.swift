@@ -48,6 +48,7 @@ final class UsageManager: ObservableObject {
 
     func refresh() async {
         claudeVersion = detectClaudeCodeVersion() ?? "2.0.31"
+        let tokenWasCached = cachedToken != nil
         do {
             // Use cached token if available to avoid keychain password prompts
             if cachedToken == nil {
@@ -62,7 +63,14 @@ final class UsageManager: ObservableObject {
             self.consecutiveFailures = 0
             self.isStale = false
         } catch let error as URLError where error.code == .userAuthenticationRequired {
-            // Token may have been rotated — clear cache and retry once
+            // Only retry if we used a stale in-memory token — re-reading keychain
+            // may get a rotated token. If we already read fresh from keychain this
+            // cycle, retrying would just prompt the user again for the same token.
+            guard tokenWasCached else {
+                cachedToken = nil
+                handleRefreshFailure(error: error)
+                return
+            }
             cachedToken = nil
             do {
                 cachedToken = try KeychainHelper.readOAuthToken()
@@ -84,15 +92,14 @@ final class UsageManager: ObservableObject {
     private func handleRefreshFailure(error: Error) {
         consecutiveFailures += 1
 
-        // 429 is a known server-side issue — keep showing last-known data as stale
+        // 429 is rate limiting — keep showing last-known data as stale.
+        // Don't clear the cached token: rate limiting doesn't mean the token is
+        // invalid, and clearing it forces a Keychain read that can trigger a
+        // macOS password prompt (blocking all refreshes if the user is away).
         if let apiError = error as? APIError, case .rateLimited = apiError {
             if usage != nil {
                 self.isStale = true
                 self.errorMessage = nil // cached data IS the display, not an error
-            }
-            // After repeated 429s, clear token in case it's expired/invalid
-            if consecutiveFailures >= 2 {
-                cachedToken = nil
             }
             return
         }
