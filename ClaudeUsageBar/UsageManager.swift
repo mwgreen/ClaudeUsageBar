@@ -4,6 +4,7 @@ import Combine
 enum APIError: LocalizedError {
     case rateLimited
     case httpError(statusCode: Int, body: String)
+    case oauthRefreshFailed(statusCode: Int, body: String)
 
     var errorDescription: String? {
         switch self {
@@ -12,6 +13,9 @@ enum APIError: LocalizedError {
         case .httpError(let statusCode, let body):
             let truncated = body.count > 200 ? String(body.prefix(200)) + "…" : body
             return "HTTP \(statusCode): \(truncated)"
+        case .oauthRefreshFailed(let statusCode, let body):
+            let truncated = body.count > 200 ? String(body.prefix(200)) + "…" : body
+            return "OAuth refresh failed (\(statusCode)): \(truncated)"
         }
     }
 }
@@ -25,10 +29,16 @@ final class UsageManager: ObservableObject {
 
     private var timer: Timer?
     private let refreshInterval: TimeInterval = 300 // 5 minutes
-    private var cachedToken: String?
+    private var cachedCreds: ClaudeCredentials?
     private var claudeVersion: String = "2.0.31"
     private var consecutiveFailures: Int = 0
     private let maxFailuresBeforeStale: Int = 3 // ~15 min at 5-min intervals
+
+    // Claude Code's public OAuth client. Same ID used by the CLI.
+    private let oauthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    private let oauthTokenURL = "https://claude.ai/v1/oauth/token"
+    /// Refresh proactively if the access token expires within this window.
+    private let refreshSkew: TimeInterval = 60
 
     init() {
         Task { [weak self] in
@@ -48,14 +58,9 @@ final class UsageManager: ObservableObject {
 
     func refresh() async {
         claudeVersion = detectClaudeCodeVersion() ?? "2.0.31"
-        let tokenWasCached = cachedToken != nil
         do {
-            // Use cached token if available to avoid keychain password prompts
-            if cachedToken == nil {
-                cachedToken = try KeychainHelper.readOAuthToken()
-            }
-            let token = cachedToken!
-            let data = try await fetchUsage(token: token)
+            let creds = try await ensureFreshCredentials()
+            let data = try await fetchUsage(token: creds.accessToken)
             let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
             self.usage = decoded
             self.errorMessage = nil
@@ -63,18 +68,11 @@ final class UsageManager: ObservableObject {
             self.consecutiveFailures = 0
             self.isStale = false
         } catch let error as URLError where error.code == .userAuthenticationRequired {
-            // Only retry if we used a stale in-memory token — re-reading keychain
-            // may get a rotated token. If we already read fresh from keychain this
-            // cycle, retrying would just prompt the user again for the same token.
-            guard tokenWasCached else {
-                cachedToken = nil
-                handleRefreshFailure(error: error)
-                return
-            }
-            cachedToken = nil
+            // Access token was rejected despite passing the expiry check — force
+            // a refresh and retry once. If that fails too, surface the error.
             do {
-                cachedToken = try KeychainHelper.readOAuthToken()
-                let data = try await fetchUsage(token: cachedToken!)
+                let refreshed = try await forceRefreshCredentials()
+                let data = try await fetchUsage(token: refreshed.accessToken)
                 let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
                 self.usage = decoded
                 self.errorMessage = nil
@@ -87,6 +85,88 @@ final class UsageManager: ObservableObject {
         } catch {
             handleRefreshFailure(error: error)
         }
+    }
+
+    private func ensureFreshCredentials() async throws -> ClaudeCredentials {
+        if cachedCreds == nil {
+            cachedCreds = try KeychainHelper.readCredentials()
+        }
+        guard var creds = cachedCreds else { throw KeychainError.itemNotFound }
+
+        if creds.expiresAt.timeIntervalSinceNow > refreshSkew {
+            return creds
+        }
+
+        // Re-read keychain first in case another Claude Code instance just refreshed.
+        creds = try KeychainHelper.readCredentials()
+        cachedCreds = creds
+        if creds.expiresAt.timeIntervalSinceNow > refreshSkew {
+            return creds
+        }
+
+        return try await forceRefreshCredentials()
+    }
+
+    private func forceRefreshCredentials() async throws -> ClaudeCredentials {
+        let current: ClaudeCredentials
+        if let cached = cachedCreds {
+            current = cached
+        } else {
+            current = try KeychainHelper.readCredentials()
+        }
+        guard !current.refreshToken.isEmpty else {
+            throw URLError(.userAuthenticationRequired)
+        }
+
+        let refreshed = try await performOAuthRefresh(refreshToken: current.refreshToken)
+        try KeychainHelper.writeBackCredentials(
+            accessToken: refreshed.accessToken,
+            refreshToken: refreshed.refreshToken,
+            expiresAt: refreshed.expiresAt
+        )
+        cachedCreds = refreshed
+        return refreshed
+    }
+
+    private func performOAuthRefresh(refreshToken: String) async throws -> ClaudeCredentials {
+        guard let url = URL(string: oauthTokenURL) else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("claude-code/\(claudeVersion)", forHTTPHeaderField: "User-Agent")
+
+        var components = URLComponents()
+        components.queryItems = [
+            URLQueryItem(name: "grant_type", value: "refresh_token"),
+            URLQueryItem(name: "client_id", value: oauthClientId),
+            URLQueryItem(name: "refresh_token", value: refreshToken)
+        ]
+        request.httpBody = components.percentEncodedQuery?.data(using: .utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw APIError.oauthRefreshFailed(statusCode: http.statusCode, body: body)
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let access = json["access_token"] as? String else {
+            throw APIError.oauthRefreshFailed(statusCode: http.statusCode, body: "no access_token in response")
+        }
+        let newRefresh = (json["refresh_token"] as? String) ?? refreshToken
+        let expiresIn = (json["expires_in"] as? Double) ?? 36_000
+        return ClaudeCredentials(
+            accessToken: access,
+            refreshToken: newRefresh,
+            expiresAt: Date().addingTimeInterval(expiresIn)
+        )
     }
 
     private func handleRefreshFailure(error: Error) {
@@ -112,9 +192,9 @@ final class UsageManager: ObservableObject {
             self.isStale = false
         }
 
-        // Force token refresh on persistent errors (not just 401/403)
+        // Force re-read from keychain on persistent errors
         if consecutiveFailures >= 2 {
-            cachedToken = nil
+            cachedCreds = nil
         }
     }
 
