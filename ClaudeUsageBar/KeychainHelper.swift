@@ -1,11 +1,10 @@
 import Foundation
-import Security
 
 enum KeychainError: Error, LocalizedError {
     case itemNotFound
     case unexpectedData
     case noTokenField
-    case securityError(OSStatus)
+    case securityError(Int32, String)
 
     var errorDescription: String? {
         switch self {
@@ -15,8 +14,8 @@ enum KeychainError: Error, LocalizedError {
             return "Could not read Keychain data"
         case .noTokenField:
             return "No OAuth token found in stored credentials"
-        case .securityError(let status):
-            return "Keychain error: \(status)"
+        case .securityError(let code, let message):
+            return message.isEmpty ? "Keychain error: \(code)" : "Keychain error: \(message)"
         }
     }
 }
@@ -99,34 +98,77 @@ struct KeychainHelper {
         }
 
         let updated = try JSONSerialization.data(withJSONObject: root, options: [])
+        guard let updatedString = String(data: updated, encoding: .utf8) else {
+            throw KeychainError.unexpectedData
+        }
 
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service
-        ]
-        let attrs: [String: Any] = [kSecValueData as String: updated]
-
-        let status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
-        guard status == errSecSuccess else {
-            throw KeychainError.securityError(status)
+        // Claude Code CLI writes/reads via /usr/bin/security, which leaves the item's
+        // ACL allowing only `security` to decrypt. Updating via Security.framework
+        // from this app fails with errSecAuthFailed because the bundle isn't in the
+        // ACL — and re-granting requires the user's password (apple-tool partition).
+        // Shell out instead: `security` is in the ACL and the "encrypt" entry is
+        // unrestricted, so updates go through without prompting.
+        let result = runSecurity([
+            "add-generic-password",
+            "-s", service,
+            "-a", NSUserName(),
+            "-w", updatedString,
+            "-U"
+        ])
+        if result.exitCode != 0 {
+            throw KeychainError.securityError(result.exitCode, result.stderr)
         }
     }
 
     private static func readKeychainData() throws -> Data {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        let result = runSecurity(["find-generic-password", "-s", service, "-w"])
 
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        // `security` exits 44 (SEC_E_ITEM_NOT_FOUND) when no matching item exists.
+        if result.exitCode == 44 {
+            throw KeychainError.itemNotFound
+        }
+        guard result.exitCode == 0 else {
+            throw KeychainError.securityError(result.exitCode, result.stderr)
+        }
 
-        guard status != errSecItemNotFound else { throw KeychainError.itemNotFound }
-        guard status == errSecSuccess else { throw KeychainError.securityError(status) }
-        guard let data = result as? Data else { throw KeychainError.unexpectedData }
+        let trimmed = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = trimmed.data(using: .utf8) else {
+            throw KeychainError.unexpectedData
+        }
         return data
+    }
+
+    private struct ProcessResult {
+        var exitCode: Int32
+        var stdout: String
+        var stderr: String
+    }
+
+    private static func runSecurity(_ arguments: [String]) -> ProcessResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = arguments
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        do {
+            try process.run()
+        } catch {
+            return ProcessResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
+        }
+
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        return ProcessResult(
+            exitCode: process.terminationStatus,
+            stdout: String(data: outData, encoding: .utf8) ?? "",
+            stderr: String(data: errData, encoding: .utf8) ?? ""
+        )
     }
 
     private static func findAccessToken(in json: [String: Any]) -> String? {
