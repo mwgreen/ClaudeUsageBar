@@ -1,6 +1,14 @@
 # ClaudeUsageBar
 
-macOS menu bar app that surfaces Claude API usage. Reads the `Claude Code-credentials` Keychain item managed by the Claude CLI.
+macOS menu bar app that shows Claude Code subscription rate-limit utilization — the 5-hour session, 7-day weekly, and 7-day Opus buckets reported by Anthropic's usage endpoint. Requires a logged-in Claude CLI: the app reads the `Claude Code-credentials` Keychain item the CLI manages.
+
+The menu bar shows `🟢 5h: 12% | 7d: 34%` (dot turns yellow at 50%, red at 80%). The menu adds reset times, a 7-day Opus row when nonzero, Launch at Login, and Refresh Now. Usage polls every 5 minutes; when rate-limited, the last-known numbers stay up with a ⧖ stale marker.
+
+## Credential handling
+
+The app doesn't just read the Keychain item — when the access token is expired (or rejected), it refreshes it against `https://claude.ai/v1/oauth/token` using Claude Code's public OAuth client ID, then **writes the new tokens back into the shared `Claude Code-credentials` item** so the CLI and this app stay in sync. Write-back preserves the rest of the stored JSON (e.g. `mcpOAuth`, scopes).
+
+Keychain reads and writes shell out to `/usr/bin/security` rather than using Security.framework, because the CLI creates the item with an ACL that only allows `security` to decrypt it. This is also why the app sandbox is disabled in the entitlements.
 
 ## Build
 
@@ -34,19 +42,15 @@ security find-certificate -c "Matt Green Code Signing" -p | openssl x509 -noout 
 
 No `security add-trusted-cert` step is needed — the cert does not require an explicit user trust setting for code signing to work.
 
-### Wire it into the Xcode project
+### Xcode project configuration
 
-In `ClaudeUsageBar.xcodeproj/project.pbxproj`, both occurrences of
-
-```
-CODE_SIGN_IDENTITY = "-";
-```
-
-should be
+The project is already configured for this identity — `ClaudeUsageBar.xcodeproj/project.pbxproj` has both occurrences of
 
 ```
 CODE_SIGN_IDENTITY = "Matt Green Code Signing";
 ```
+
+so the build fails until a cert with that exact name exists in your login keychain. Either create it as above, or if you named your cert differently, update both occurrences to match (or set them to `"-"` for an ad-hoc build, at the cost of the Keychain re-prompts described earlier).
 
 Keep `CODE_SIGN_STYLE = Manual;` and do **not** set `DEVELOPMENT_TEAM`.
 
