@@ -238,9 +238,16 @@ final class UsageManager: ObservableObject {
         }
         let h5 = Int(usage.fiveHour.utilization.rounded())
         let d7 = Int(usage.sevenDay.utilization.rounded())
-        let dot = colorDot(for: max(usage.fiveHour.utilization, usage.sevenDay.utilization))
+        var worst = max(usage.fiveHour.utilization, usage.sevenDay.utilization)
+        var scopedText = ""
+        for limit in usage.scopedModelLimits {
+            guard let name = limit.scope?.model?.displayName, let percent = limit.percent else { continue }
+            scopedText += " | \(name): \(Int(percent.rounded()))%"
+            worst = max(worst, percent)
+        }
+        let dot = colorDot(for: worst)
         let staleIndicator = isStale ? " \u{29D6}" : ""
-        return "\(dot) 5h: \(h5)% | 7d: \(d7)%\(staleIndicator)"
+        return "\(dot) 5h: \(h5)% | 7d: \(d7)%\(scopedText)\(staleIndicator)"
     }
 
     func colorDot(for utilization: Double) -> String {

@@ -71,6 +71,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 opusItem.isEnabled = false
                 menu.addItem(opusItem)
             }
+
+            for limit in usage.scopedModelLimits {
+                guard let name = limit.scope?.model?.displayName, let percent = limit.percent else { continue }
+                let val = Int(percent.rounded())
+                let item = NSMenuItem(title: "7-day \(name): \(val)% \u{2014} \(usageManager.relativeReset(from: limit.resetsAt))", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+            }
         } else if usageManager.errorMessage == nil {
             let item = NSMenuItem(title: "Loading...", action: nil, keyEquivalent: "")
             item.isEnabled = false
