@@ -2,7 +2,13 @@
 
 macOS menu bar app that shows Claude Code subscription rate-limit utilization — the 5-hour session, 7-day weekly, and per-model weekly buckets reported by Anthropic's usage endpoint — for up to **two accounts**. Requires a logged-in Claude CLI: the app reads the `Claude Code-credentials` Keychain items the CLI manages (including the hash-suffixed items created per `CLAUDE_CONFIG_DIR` profile).
 
-With one account, the bar shows a compact single line of percentages (`34·21·8` = 5h · 7d · per-model weekly), each number colored green / orange (≥50%) / red (≥80%). With a second account assigned, the bar stacks two small rows, prefixed `P` and `W`. The dropdown menu shows the full breakdown per account with reset times, plus an **Accounts** submenu that lists every detected credential item so you can choose which item is P and which is W (saved in preferences). Usage polls every 5 minutes; when rate-limited, the last-known numbers stay up with a ⧖ stale marker.
+With one account, the bar shows a compact single line of percentages (`34·21·8` = 5h · 7d · per-model weekly), each number colored green / orange (≥50%) / red (≥80%). With a second account assigned, the bar stacks two small rows, prefixed `P` and `W`. If an account's fetch fails outright, its row shows a red `!` and the dropdown shows the error under that account's header. Usage polls every 5 minutes; when rate-limited, the last-known numbers stay up with a ⧖ stale marker.
+
+The dropdown menu shows the full breakdown per account with reset times, plus **Account P:** and **Account W:** submenus listing every detected credential item so you can assign (or clear, for W) each slot. Items are labeled with friendly profile names: the CLI derives each profile's keychain suffix from `sha256(CLAUDE_CONFIG_DIR)` truncated to 8 hex chars, and the app reverse-maps suffixes by hashing the `~/.claude-*` directories (the plain item shows as `default`). Assignments persist in `defaults` under `com.mwgreen.ClaudeUsageBar` as `AccountPService` / `AccountWService` (full keychain service names), handy for scripting:
+
+```sh
+defaults write com.mwgreen.ClaudeUsageBar AccountWService "Claude Code-credentials-<suffix>"
+```
 
 ## Credential handling
 
@@ -75,6 +81,6 @@ codesign -dv --verbose=2 /Applications/ClaudeUsageBar.app 2>&1 | grep Authority
 
 macOS shows a Keychain dialog asking ClaudeUsageBar to access the `Claude Code-credentials` item. Click **Always Allow**. Subsequent launches and Claude CLI token refreshes won't re-prompt.
 
-The approval is per Keychain item, so assigning a second account in the **Accounts** submenu triggers one more dialog for that account's item — click **Always Allow** there too.
+The approval is per Keychain item, so assigning a second account in the **Account W:** submenu may trigger one more dialog for that account's item — click **Always Allow** there too. (Detecting the items never prompts: discovery uses an attributes-only Keychain query that doesn't decrypt anything.)
 
 If the cert is ever regenerated (e.g. after macOS reinstall), the approval must be granted once more.
