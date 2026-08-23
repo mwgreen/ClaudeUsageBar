@@ -1,12 +1,12 @@
 # ClaudeUsageBar
 
-macOS menu bar app that shows Claude Code subscription rate-limit utilization — the 5-hour session, 7-day weekly, and 7-day Opus buckets reported by Anthropic's usage endpoint. Requires a logged-in Claude CLI: the app reads the `Claude Code-credentials` Keychain item the CLI manages.
+macOS menu bar app that shows Claude Code subscription rate-limit utilization — the 5-hour session, 7-day weekly, and per-model weekly buckets reported by Anthropic's usage endpoint — for up to **two accounts**. Requires a logged-in Claude CLI: the app reads the `Claude Code-credentials` Keychain items the CLI manages (including the hash-suffixed items created per `CLAUDE_CONFIG_DIR` profile).
 
-The menu bar shows `🟢 5h: 12% | 7d: 34%` (dot turns yellow at 50%, red at 80%). The menu adds reset times, a 7-day Opus row when nonzero, Launch at Login, and Refresh Now. Usage polls every 5 minutes; when rate-limited, the last-known numbers stay up with a ⧖ stale marker.
+With one account, the bar shows a compact single line of percentages (`34·21·8` = 5h · 7d · per-model weekly), each number colored green / orange (≥50%) / red (≥80%). With a second account assigned, the bar stacks two small rows, prefixed `P` and `W`. The dropdown menu shows the full breakdown per account with reset times, plus an **Accounts** submenu that lists every detected credential item so you can choose which item is P and which is W (saved in preferences). Usage polls every 5 minutes; when rate-limited, the last-known numbers stay up with a ⧖ stale marker.
 
 ## Credential handling
 
-The app doesn't just read the Keychain item — when the access token is expired (or rejected), it refreshes it against `https://claude.ai/v1/oauth/token` using Claude Code's public OAuth client ID, then **writes the new tokens back into the shared `Claude Code-credentials` item** so the CLI and this app stay in sync. Write-back preserves the rest of the stored JSON (e.g. `mcpOAuth`, scopes).
+The app doesn't just read the Keychain item — when an account's access token is expired (or rejected), it refreshes it against `https://claude.ai/v1/oauth/token` using Claude Code's public OAuth client ID, then **writes the new tokens back into that account's shared Keychain item** so the CLI and this app stay in sync. Write-back preserves the rest of the stored JSON (e.g. `mcpOAuth`, scopes).
 
 Keychain reads and writes shell out to `/usr/bin/security` rather than using Security.framework, because the CLI creates the item with an ACL that only allows `security` to decrypt it. This is also why the app sandbox is disabled in the entitlements.
 
@@ -74,5 +74,7 @@ codesign -dv --verbose=2 /Applications/ClaudeUsageBar.app 2>&1 | grep Authority
 ### First launch
 
 macOS shows a Keychain dialog asking ClaudeUsageBar to access the `Claude Code-credentials` item. Click **Always Allow**. Subsequent launches and Claude CLI token refreshes won't re-prompt.
+
+The approval is per Keychain item, so assigning a second account in the **Accounts** submenu triggers one more dialog for that account's item — click **Always Allow** there too.
 
 If the cert is ever regenerated (e.g. after macOS reinstall), the approval must be granted once more.

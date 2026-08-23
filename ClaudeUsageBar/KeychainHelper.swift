@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import Security
 
 enum KeychainError: Error, LocalizedError {
     case itemNotFound
@@ -28,14 +30,59 @@ struct ClaudeCredentials {
 }
 
 struct KeychainHelper {
-    private static let service = "Claude Code-credentials"
+    /// The service name of the default (non-profile) Claude CLI credential item.
+    static let defaultService = "Claude Code-credentials"
+
+    /// Lists all keychain generic-password services that look like Claude CLI
+    /// credential items ("Claude Code-credentials" plus the hash-suffixed
+    /// variants created per CLAUDE_CONFIG_DIR profile). Attribute-only query,
+    /// so no decryption and no ACL prompt.
+    static func discoverServices() -> [String] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
+            return [defaultService]
+        }
+        let services = Set(items.compactMap { $0[kSecAttrService as String] as? String }
+            .filter { $0.hasPrefix(defaultService) })
+        // Default item first, then suffixed profiles alphabetically.
+        return services.sorted { a, b in
+            if a == defaultService { return true }
+            if b == defaultService { return false }
+            return a < b
+        }
+    }
+
+    /// Maps credential service names to friendly profile names. The CLI derives
+    /// each profile's keychain suffix from sha256(CLAUDE_CONFIG_DIR)[0..<8], so
+    /// hashing the ~/.claude-* directories recovers the dir behind each item.
+    static func profileNames() -> [String: String] {
+        var map = [defaultService: "default"]
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        let entries = (try? fm.contentsOfDirectory(atPath: home)) ?? []
+        for entry in entries where entry.hasPrefix(".claude-") {
+            let path = home + "/" + entry
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
+            let digest = SHA256.hash(data: Data(path.utf8))
+            let suffix = digest.map { String(format: "%02x", $0) }.joined().prefix(8)
+            map["\(defaultService)-\(suffix)"] = String(entry.dropFirst(".claude-".count))
+        }
+        return map
+    }
 
     /// Reads the full Claude Code credential blob. Falls back to searching any
     /// string that looks like an access token if the JSON shape is unexpected,
     /// in which case refreshToken/expiresAt are empty/distant-past and callers
     /// must treat the token as non-refreshable.
-    static func readCredentials() throws -> ClaudeCredentials {
-        let data = try readKeychainData()
+    static func readCredentials(service: String) throws -> ClaudeCredentials {
+        let data = try readKeychainData(service: service)
 
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             if let raw = String(data: data, encoding: .utf8),
@@ -69,16 +116,11 @@ struct KeychainHelper {
         throw KeychainError.noTokenField
     }
 
-    /// Backward-compatible helper that returns just the access token.
-    static func readOAuthToken() throws -> String {
-        return try readCredentials().accessToken
-    }
-
     /// Writes updated tokens back to the keychain, preserving the rest of the
     /// stored JSON (e.g. mcpOAuth, subscriptionType, scopes) so Claude CLI is
     /// not disrupted.
-    static func writeBackCredentials(accessToken: String, refreshToken: String, expiresAt: Date) throws {
-        let existing = try readKeychainData()
+    static func writeBackCredentials(service: String, accessToken: String, refreshToken: String, expiresAt: Date) throws {
+        let existing = try readKeychainData(service: service)
 
         guard var root = try? JSONSerialization.jsonObject(with: existing) as? [String: Any] else {
             throw KeychainError.unexpectedData
@@ -120,7 +162,7 @@ struct KeychainHelper {
         }
     }
 
-    private static func readKeychainData() throws -> Data {
+    private static func readKeychainData(service: String) throws -> Data {
         let result = runSecurity(["find-generic-password", "-s", service, "-w"])
 
         // `security` exits 44 (SEC_E_ITEM_NOT_FOUND) when no matching item exists.

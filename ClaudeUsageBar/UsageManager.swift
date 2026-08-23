@@ -27,6 +27,9 @@ final class UsageManager: ObservableObject {
     @Published var lastUpdated: Date?
     @Published var isStale: Bool = false
 
+    /// Keychain service name of the credential item this instance tracks.
+    let service: String
+
     private var timer: Timer?
     private let refreshInterval: TimeInterval = 300 // 5 minutes
     private var cachedCreds: ClaudeCredentials?
@@ -40,7 +43,8 @@ final class UsageManager: ObservableObject {
     /// Refresh proactively if the access token expires within this window.
     private let refreshSkew: TimeInterval = 60
 
-    init() {
+    init(service: String) {
+        self.service = service
         Task { [weak self] in
             await self?.refresh()
         }
@@ -89,7 +93,7 @@ final class UsageManager: ObservableObject {
 
     private func ensureFreshCredentials() async throws -> ClaudeCredentials {
         if cachedCreds == nil {
-            cachedCreds = try KeychainHelper.readCredentials()
+            cachedCreds = try KeychainHelper.readCredentials(service: service)
         }
         guard var creds = cachedCreds else { throw KeychainError.itemNotFound }
 
@@ -98,7 +102,7 @@ final class UsageManager: ObservableObject {
         }
 
         // Re-read keychain first in case another Claude Code instance just refreshed.
-        creds = try KeychainHelper.readCredentials()
+        creds = try KeychainHelper.readCredentials(service: service)
         cachedCreds = creds
         if creds.expiresAt.timeIntervalSinceNow > refreshSkew {
             return creds
@@ -112,7 +116,7 @@ final class UsageManager: ObservableObject {
         if let cached = cachedCreds {
             current = cached
         } else {
-            current = try KeychainHelper.readCredentials()
+            current = try KeychainHelper.readCredentials(service: service)
         }
         guard !current.refreshToken.isEmpty else {
             throw URLError(.userAuthenticationRequired)
@@ -120,6 +124,7 @@ final class UsageManager: ObservableObject {
 
         let refreshed = try await performOAuthRefresh(refreshToken: current.refreshToken)
         try KeychainHelper.writeBackCredentials(
+            service: service,
             accessToken: refreshed.accessToken,
             refreshToken: refreshed.refreshToken,
             expiresAt: refreshed.expiresAt
@@ -229,33 +234,25 @@ final class UsageManager: ObservableObject {
 
     // MARK: - Display helpers
 
-    var menuBarText: String {
-        guard let usage else {
-            if errorMessage != nil {
-                return "\u{26AA} --"
-            }
-            return "\u{26AA} --"
-        }
-        let h5 = Int(usage.fiveHour.utilization.rounded())
-        let d7 = Int(usage.sevenDay.utilization.rounded())
-        var worst = max(usage.fiveHour.utilization, usage.sevenDay.utilization)
-        var scopedText = ""
-        for limit in usage.scopedModelLimits {
-            guard let name = limit.scope?.model?.displayName, let percent = limit.percent else { continue }
-            scopedText += " | \(name): \(Int(percent.rounded()))%"
-            worst = max(worst, percent)
-        }
-        let dot = colorDot(for: worst)
-        let staleIndicator = isStale ? " \u{29D6}" : ""
-        return "\(dot) 5h: \(h5)% | 7d: \(d7)%\(scopedText)\(staleIndicator)"
+    struct Metric {
+        let name: String
+        let percent: Double
+        let resetsAt: String?
     }
 
-    func colorDot(for utilization: Double) -> String {
-        switch utilization {
-        case ..<50: return "\u{1F7E2}"   // green circle
-        case 50..<80: return "\u{1F7E1}" // yellow circle
-        default: return "\u{1F534}"      // red circle
+    /// Buckets in display order for the compact menu bar line: 5h, 7d, then any
+    /// per-model weekly limits (e.g. Fable).
+    var metrics: [Metric] {
+        guard let usage else { return [] }
+        var out = [
+            Metric(name: "5h", percent: usage.fiveHour.utilization, resetsAt: usage.fiveHour.resetsAt),
+            Metric(name: "7d", percent: usage.sevenDay.utilization, resetsAt: usage.sevenDay.resetsAt)
+        ]
+        for limit in usage.scopedModelLimits {
+            guard let name = limit.scope?.model?.displayName, let percent = limit.percent else { continue }
+            out.append(Metric(name: name, percent: percent, resetsAt: limit.resetsAt))
         }
+        return out
     }
 
     var lastUpdatedText: String {
