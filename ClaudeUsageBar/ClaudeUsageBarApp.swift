@@ -296,13 +296,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        let service = SMAppService.mainApp
         do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
+            if service.status == .enabled {
+                try service.unregister()
             } else {
-                try SMAppService.mainApp.register()
+                try service.register()
             }
-        } catch {}
+        } catch {
+            NSLog("Launch at Login toggle failed: %@", error.localizedDescription)
+            let alert = NSAlert()
+            alert.messageText = "Couldn't change Launch at Login"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+        NSLog("Launch at Login status: %d", service.status.rawValue)
+        if service.status == .requiresApproval {
+            SMAppService.openSystemSettingsLoginItems()
+        }
     }
 
     @objc private func refreshNow() {
