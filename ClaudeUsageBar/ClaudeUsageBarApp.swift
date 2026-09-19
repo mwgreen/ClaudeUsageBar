@@ -159,9 +159,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Extra-usage ("usage credits") spend, only once some has been used.
         // Colored against the monthly limit when there is one.
-        if let extra = account.manager.extraUsage, extra.hasSpend {
+        if let extra = account.manager.extraUsage, extra.hasSpend, let used = extra.used {
             line.append(separator)
-            line.append(NSAttributedString(string: extra.used, attributes: [
+            line.append(NSAttributedString(string: used, attributes: [
                 .font: font, .foregroundColor: extra.percent.map(color(for:)) ?? NSColor.labelColor
             ]))
         }
@@ -266,14 +266,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             if let extra = manager.extraUsage {
-                var text = "Extra usage: \(extra.used)"
-                if let limit = extra.limit {
-                    text += " of \(limit)"
-                    if let percent = extra.percent {
-                        text += " (\(Int(percent.rounded()))%)"
+                var text = "Extra usage: "
+                if let used = extra.used {
+                    text += used
+                    if let limit = extra.limit {
+                        text += " of \(limit)"
+                        if let percent = extra.percent {
+                            text += " (\(Int(percent.rounded()))%)"
+                        }
+                    } else {
+                        text += " \u{2014} no monthly limit"
+                    }
+                    if !extra.isEnabled {
+                        text += " \u{2014} disabled"
+                        if let reason = extra.disabledReason {
+                            text += ": \(reason.replacingOccurrences(of: "_", with: " "))"
+                        }
                     }
                 } else {
-                    text += " \u{2014} no monthly limit"
+                    // Disabled with no spend figure (the server withholds
+                    // used_credits while disabled), e.g. out of credits.
+                    text += "disabled"
+                    if let reason = extra.disabledReason {
+                        text += " \u{2014} \(reason.replacingOccurrences(of: "_", with: " "))"
+                    }
                 }
                 let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
                 item.isEnabled = false

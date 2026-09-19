@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import os
 
 enum APIError: LocalizedError {
     case rateLimited
@@ -42,6 +43,11 @@ final class UsageManager: ObservableObject {
     private var claudeVersion: String = "2.0.31"
     private var consecutiveFailures: Int = 0
     private let maxFailuresBeforeStale: Int = 3 // ~15 min at 5-min intervals
+
+    /// Poll outcomes go to the unified log as public messages (NSLog text is
+    /// redacted to <private> there):
+    ///   /usr/bin/log show --predicate 'subsystem == "com.mwgreen.ClaudeUsageBar"' --last 1h
+    private let log = Logger(subsystem: "com.mwgreen.ClaudeUsageBar", category: "usage")
 
     // Claude Code's public OAuth client. Same ID used by the CLI.
     private let oauthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -89,6 +95,7 @@ final class UsageManager: ObservableObject {
 
     private func applySuccessfulFetch(_ data: Data) throws {
         let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
+        logFetch(data, decoded)
         usage = decoded
         errorMessage = nil
         loggedOutReason = nil
@@ -192,6 +199,7 @@ final class UsageManager: ObservableObject {
         // logged out (or its login expired). Hide it until a fresh login shows
         // up in the Keychain; clearing the cache makes the next poll re-read it.
         if let reason = loggedOutReason(for: error) {
+            log.notice("[\(self.service, privacy: .public)] \(reason, privacy: .public): \(error.localizedDescription, privacy: .public)")
             loggedOutReason = reason
             usage = nil
             isStale = false
@@ -201,6 +209,7 @@ final class UsageManager: ObservableObject {
             return
         }
 
+        log.error("[\(self.service, privacy: .public)] refresh failed: \(error.localizedDescription, privacy: .public)")
         consecutiveFailures += 1
 
         // 429 is rate limiting — keep showing last-known data as stale.
@@ -249,6 +258,22 @@ final class UsageManager: ObservableObject {
             return "Login expired"
         }
         return nil
+    }
+
+    /// One line per successful poll in the unified log, including the raw
+    /// extra_usage value so a vanished amount can be traced to what the server
+    /// actually sent.
+    private func logFetch(_ data: Data, _ decoded: UsageResponse) {
+        var extraDescription = "absent"
+        if let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let value = root["extra_usage"] {
+            extraDescription = value is NSNull
+                ? "null"
+                : String(describing: value).replacingOccurrences(of: "\n", with: " ")
+        }
+        let fiveHour = Int(decoded.fiveHour.utilization.rounded())
+        let sevenDay = Int(decoded.sevenDay.utilization.rounded())
+        log.notice("[\(self.service, privacy: .public)] usage ok: 5h=\(fiveHour)% 7d=\(sevenDay)% extra_usage=\(extraDescription, privacy: .public)")
     }
 
     private func fetchUsage(token: String) async throws -> Data {
@@ -306,23 +331,34 @@ final class UsageManager: ObservableObject {
     /// Extra-usage ("usage credits") spend for the billing period, when the
     /// plan has it enabled. Money strings are formatted in the response currency.
     struct ExtraUsageSummary {
-        let used: String
+        /// Formatted spend, when the server reports one. While extra usage is
+        /// disabled (e.g. out_of_credits) the server sends used_credits as null.
+        let used: String?
         let limit: String?
         /// Spend as a percentage of the monthly limit; nil when there is no limit.
         let percent: Double?
         let hasSpend: Bool
+        /// False while the server says extra usage can't cover sends.
+        let isEnabled: Bool
+        /// Server's reason when disabled, e.g. "out_of_credits".
+        let disabledReason: String?
     }
 
+    /// Non-nil when there is something to say: a reported spend amount, or
+    /// extra usage disabled for a stated reason. An account that simply has
+    /// extra usage switched off yields nil.
     var extraUsage: ExtraUsageSummary? {
-        guard let extra = usage?.extraUsage, extra.isEnabled == true, let used = extra.usedCredits else {
-            return nil
-        }
+        guard let extra = usage?.extraUsage else { return nil }
+        let enabled = extra.isEnabled ?? true
+        guard extra.usedCredits != nil || (!enabled && extra.disabledReason != nil) else { return nil }
         let currency = extra.currency ?? "USD"
         return ExtraUsageSummary(
-            used: formatMoney(minorUnits: used, currency: currency),
+            used: extra.usedCredits.map { formatMoney(minorUnits: $0, currency: currency) },
             limit: extra.monthlyLimit.map { formatMoney(minorUnits: $0, currency: currency) },
             percent: extra.percentOfLimit,
-            hasSpend: used > 0
+            hasSpend: (extra.usedCredits ?? 0) > 0,
+            isEnabled: enabled,
+            disabledReason: extra.disabledReason
         )
     }
 

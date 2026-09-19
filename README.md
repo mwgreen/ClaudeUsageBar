@@ -4,7 +4,13 @@ macOS menu bar app that shows Claude Code subscription rate-limit utilization �
 
 With one account, the bar shows a compact single line of percentages (`34·21·8` = 5h · 7d · per-model weekly), each number colored green / orange (≥50%) / red (≥80%). With a second account assigned, the bar stacks two small rows, prefixed `P` and `W`. If an account's fetch fails outright, its row shows a red `!` and the dropdown shows the error under that account's header. Usage polls every 5 minutes; when rate-limited, the last-known numbers stay up with a ⧖ stale marker.
 
-**Extra usage (usage credits).** When a plan has extra usage enabled (e.g. a Team account) and some has been spent this billing period, the row gains a trailing dollar amount (`34·21·8·$68.53`), read from the endpoint's `extra_usage` object (`used_credits` / `monthly_limit`, in cents). It is colored against the monthly limit when one is set. The dropdown shows `Extra usage: $68.53 of $100.00 (68%)` whenever extra usage is enabled, even at $0.
+**Extra usage (usage credits).** When a plan has extra usage enabled (e.g. a Team account) and some has been spent this billing period, the row gains a trailing dollar amount (`34·21·8·$68.53`), read from the endpoint's `extra_usage` object (`used_credits` / `monthly_limit`, in cents). It is colored against the monthly limit when one is set. The dropdown shows `Extra usage: $68.53 of $100.00 (68%)` whenever a spend amount is reported, even at $0. When the server disables extra usage it sets `is_enabled: false` with a `disabled_reason` (e.g. `out_of_credits` once the org's credit balance is used up) and reports `used_credits` as null, so the amount leaves the bar — the CLI's `/usage` goes blank at the same time — and the dropdown shows `Extra usage: disabled — out of credits` instead. If a spend figure is still reported while disabled, it stays in the bar and the dropdown appends the reason. An account with extra usage simply switched off shows nothing. Each poll writes one line to the unified log with the raw `extra_usage` value, for when an amount goes missing:
+
+```sh
+/usr/bin/log show --predicate 'subsystem == "com.mwgreen.ClaudeUsageBar"' --last 1h --style compact
+```
+
+(`log` is also a zsh builtin, hence the full path.)
 
 **Logged-out accounts are hidden.** If an account has no usable login — its Keychain item is gone (`claude logout` deletes it) or its token has expired and the OAuth refresh is rejected — its row disappears from the bar instead of showing `!`, and the dropdown says `Not logged in` or `Login expired` under that account's header. With two accounts configured and one hidden, the bar falls back to the single-line layout for the remaining account, keeping its `P`/`W` prefix. The app keeps polling (an attributes-only Keychain check plus the normal fetch), so the row comes back on the next poll after you log in again. Transient failures (network, 5xx, rate limiting) are not treated as logged out.
 

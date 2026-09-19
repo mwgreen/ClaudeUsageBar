@@ -30,11 +30,14 @@ struct ExtraUsage: Codable {
     let usedCredits: Double?
     let utilization: Double?
     let currency: String?
+    /// Why extra usage is currently disabled (e.g. out of credits), when it is.
+    let disabledReason: String?
 
     enum CodingKeys: String, CodingKey {
         case isEnabled = "is_enabled"
         case monthlyLimit = "monthly_limit"
         case usedCredits = "used_credits"
+        case disabledReason = "disabled_reason"
         case utilization, currency
     }
 
