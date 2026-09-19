@@ -5,8 +5,10 @@ import ServiceManagement
 @main
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    typealias Account = (label: String, manager: UsageManager)
+
     private var statusItem: NSStatusItem!
-    private var accounts: [(label: String, manager: UsageManager)] = []
+    private var accounts: [Account] = []
     private var cancellables = Set<AnyCancellable>()
 
     private static let accountPKey = "AccountPService"
@@ -61,25 +63,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Menu bar title
 
+    /// Accounts with a usable login. A logged-out (or login-expired) account
+    /// drops out of the menu bar entirely and comes back once it can fetch again.
+    private var visibleAccounts: [Account] {
+        accounts.filter { !$0.manager.isLoggedOut }
+    }
+
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
-        if accounts.count > 1 {
+        let visible = visibleAccounts
+        if visible.count > 1 {
             // NSStatusBarButton's cell is single-line and truncates at "\n", so
             // stacked rows are drawn into an image instead of a title.
             button.title = ""
-            button.image = twoRowImage()
+            button.image = twoRowImage(for: visible)
             button.imagePosition = .imageOnly
         } else {
             button.image = nil
             button.imagePosition = .noImage
-            button.attributedTitle = compactTitle()
+            button.attributedTitle = compactTitle(for: visible.first)
         }
         buildMenu()
     }
 
-    private func twoRowImage() -> NSImage {
+    private func twoRowImage(for visible: [Account]) -> NSImage {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .semibold)
-        let lines = accounts.map { compactLine(for: $0, font: font) }
+        let lines = visible.map { compactLine(for: $0, font: font) }
         let lineHeight = ceil(lines.map { $0.size().height }.max() ?? 11)
         let width = ceil(lines.map { $0.size().width }.max() ?? 10)
         let height: CGFloat = 22
@@ -106,15 +115,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func compactTitle() -> NSAttributedString {
+    private func compactTitle(for account: Account?) -> NSAttributedString {
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-        return compactLine(for: accounts[0], font: font)
+        guard let account else {
+            return NSAttributedString(string: "--", attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor])
+        }
+        return compactLine(for: account, font: font)
     }
 
-    private func compactLine(for account: (label: String, manager: UsageManager), font: NSFont) -> NSAttributedString {
+    private func compactLine(for account: Account, font: NSFont) -> NSAttributedString {
         let line = NSMutableAttributedString()
         let labelAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+        let separator = NSAttributedString(string: "\u{00B7}", attributes: [
+            .font: font, .foregroundColor: NSColor.tertiaryLabelColor
+        ])
 
+        // Keep the P/W prefix whenever two accounts are configured, even if only
+        // one is currently visible, so a lone row still says which account it is.
         if accounts.count > 1 {
             line.append(NSAttributedString(string: "\(account.label) ", attributes: labelAttrs))
         }
@@ -133,12 +150,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         for (index, metric) in metrics.enumerated() {
             if index > 0 {
-                line.append(NSAttributedString(string: "\u{00B7}", attributes: [
-                    .font: font, .foregroundColor: NSColor.tertiaryLabelColor
-                ]))
+                line.append(separator)
             }
             line.append(NSAttributedString(string: "\(Int(metric.percent.rounded()))", attributes: [
                 .font: font, .foregroundColor: color(for: metric.percent)
+            ]))
+        }
+
+        // Extra-usage ("usage credits") spend, only once some has been used.
+        // Colored against the monthly limit when there is one.
+        if let extra = account.manager.extraUsage, extra.hasSpend {
+            line.append(separator)
+            line.append(NSAttributedString(string: extra.used, attributes: [
+                .font: font, .foregroundColor: extra.percent.map(color(for:)) ?? NSColor.labelColor
             ]))
         }
 
@@ -184,16 +208,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
     }
 
-    private func addAccountSection(_ account: (label: String, manager: UsageManager), to menu: NSMenu) {
+    private func addAccountSection(_ account: Account, to menu: NSMenu) {
         let manager = account.manager
 
         var headerText = "Account \(account.label) \u{2014} \(shortName(for: manager.service))"
-        if manager.lastUpdated != nil {
+        if manager.lastUpdated != nil, !manager.isLoggedOut {
             headerText += " \u{00B7} updated \(manager.lastUpdatedText.lowercased())"
         }
         let header = NSMenuItem(title: headerText, action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
+
+        if let reason = manager.loggedOutReason {
+            let item = NSMenuItem(title: reason, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+            return
+        }
 
         if let error = manager.errorMessage {
             let item = NSMenuItem(title: "Error: \(error)", action: nil, keyEquivalent: "")
@@ -230,6 +261,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let name = limit.scope?.model?.displayName, let percent = limit.percent else { continue }
                 let val = Int(percent.rounded())
                 let item = NSMenuItem(title: "7-day \(name): \(val)% \u{2014} \(manager.relativeReset(from: limit.resetsAt))", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                menu.addItem(item)
+            }
+
+            if let extra = manager.extraUsage {
+                var text = "Extra usage: \(extra.used)"
+                if let limit = extra.limit {
+                    text += " of \(limit)"
+                    if let percent = extra.percent {
+                        text += " (\(Int(percent.rounded()))%)"
+                    }
+                } else {
+                    text += " \u{2014} no monthly limit"
+                }
+                let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
                 item.isEnabled = false
                 menu.addItem(item)
             }

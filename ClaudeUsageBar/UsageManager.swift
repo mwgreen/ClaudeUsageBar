@@ -26,6 +26,12 @@ final class UsageManager: ObservableObject {
     @Published var errorMessage: String?
     @Published var lastUpdated: Date?
     @Published var isStale: Bool = false
+    /// Non-nil when this profile has no usable login: the Keychain item is gone
+    /// (`claude logout` deletes it) or the token expired and could not be
+    /// refreshed. The account is hidden from the menu bar until a login reappears.
+    @Published var loggedOutReason: String?
+
+    var isLoggedOut: Bool { loggedOutReason != nil }
 
     /// Keychain service name of the credential item this instance tracks.
     let service: String
@@ -65,24 +71,14 @@ final class UsageManager: ObservableObject {
         do {
             let creds = try await ensureFreshCredentials()
             let data = try await fetchUsage(token: creds.accessToken)
-            let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
-            self.usage = decoded
-            self.errorMessage = nil
-            self.lastUpdated = Date()
-            self.consecutiveFailures = 0
-            self.isStale = false
+            try applySuccessfulFetch(data)
         } catch let error as URLError where error.code == .userAuthenticationRequired {
             // Access token was rejected despite passing the expiry check — force
             // a refresh and retry once. If that fails too, surface the error.
             do {
                 let refreshed = try await forceRefreshCredentials()
                 let data = try await fetchUsage(token: refreshed.accessToken)
-                let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
-                self.usage = decoded
-                self.errorMessage = nil
-                self.lastUpdated = Date()
-                self.consecutiveFailures = 0
-                self.isStale = false
+                try applySuccessfulFetch(data)
             } catch {
                 handleRefreshFailure(error: error)
             }
@@ -91,7 +87,24 @@ final class UsageManager: ObservableObject {
         }
     }
 
+    private func applySuccessfulFetch(_ data: Data) throws {
+        let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
+        usage = decoded
+        errorMessage = nil
+        loggedOutReason = nil
+        lastUpdated = Date()
+        consecutiveFailures = 0
+        isStale = false
+    }
+
     private func ensureFreshCredentials() async throws -> ClaudeCredentials {
+        // Attributes-only existence check (no decrypt, so no ACL prompt) so that
+        // `claude logout`, which deletes the item, is noticed on the next poll
+        // even while a cached access token would still be accepted by the API.
+        guard KeychainHelper.itemExists(service: service) else {
+            cachedCreds = nil
+            throw KeychainError.itemNotFound
+        }
         if cachedCreds == nil {
             cachedCreds = try KeychainHelper.readCredentials(service: service)
         }
@@ -175,6 +188,19 @@ final class UsageManager: ObservableObject {
     }
 
     private func handleRefreshFailure(error: Error) {
+        // A missing or unusable login isn't an error to flag — the profile is
+        // logged out (or its login expired). Hide it until a fresh login shows
+        // up in the Keychain; clearing the cache makes the next poll re-read it.
+        if let reason = loggedOutReason(for: error) {
+            loggedOutReason = reason
+            usage = nil
+            isStale = false
+            errorMessage = nil
+            cachedCreds = nil
+            consecutiveFailures = 0
+            return
+        }
+
         consecutiveFailures += 1
 
         // 429 is rate limiting — keep showing last-known data as stale.
@@ -201,6 +227,28 @@ final class UsageManager: ObservableObject {
         if consecutiveFailures >= 2 {
             cachedCreds = nil
         }
+    }
+
+    /// Classifies errors that mean "no usable login" rather than a transient
+    /// failure: no credential item (or one without a token), an OAuth refresh the
+    /// server rejected as invalid, or an access token the API still refuses
+    /// after a forced refresh. Network errors, 5xx and 429 are not included.
+    private func loggedOutReason(for error: Error) -> String? {
+        if let keychainError = error as? KeychainError {
+            switch keychainError {
+            case .itemNotFound, .noTokenField: return "Not logged in"
+            default: return nil
+            }
+        }
+        if let apiError = error as? APIError,
+           case .oauthRefreshFailed(let status, _) = apiError,
+           [400, 401, 403].contains(status) {
+            return "Login expired"
+        }
+        if let urlError = error as? URLError, urlError.code == .userAuthenticationRequired {
+            return "Login expired"
+        }
+        return nil
     }
 
     private func fetchUsage(token: String) async throws -> Data {
@@ -253,6 +301,37 @@ final class UsageManager: ObservableObject {
             out.append(Metric(name: name, percent: percent, resetsAt: limit.resetsAt))
         }
         return out
+    }
+
+    /// Extra-usage ("usage credits") spend for the billing period, when the
+    /// plan has it enabled. Money strings are formatted in the response currency.
+    struct ExtraUsageSummary {
+        let used: String
+        let limit: String?
+        /// Spend as a percentage of the monthly limit; nil when there is no limit.
+        let percent: Double?
+        let hasSpend: Bool
+    }
+
+    var extraUsage: ExtraUsageSummary? {
+        guard let extra = usage?.extraUsage, extra.isEnabled == true, let used = extra.usedCredits else {
+            return nil
+        }
+        let currency = extra.currency ?? "USD"
+        return ExtraUsageSummary(
+            used: formatMoney(minorUnits: used, currency: currency),
+            limit: extra.monthlyLimit.map { formatMoney(minorUnits: $0, currency: currency) },
+            percent: extra.percentOfLimit,
+            hasSpend: used > 0
+        )
+    }
+
+    private func formatMoney(minorUnits: Double, currency: String) -> String {
+        let amount = minorUnits / 100
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = currency
+        return formatter.string(from: NSNumber(value: amount)) ?? String(format: "%.2f %@", amount, currency)
     }
 
     var lastUpdatedText: String {

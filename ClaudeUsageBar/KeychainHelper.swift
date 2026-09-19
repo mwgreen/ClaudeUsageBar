@@ -58,6 +58,22 @@ struct KeychainHelper {
         }
     }
 
+    /// Whether a credential item with this service name exists. Attribute-only
+    /// query: nothing is decrypted, so it never triggers an ACL prompt. Treats
+    /// unexpected Keychain errors as "exists" so only a definite not-found hides
+    /// an account.
+    static func itemExists(service: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnAttributes as String: true
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return status != errSecItemNotFound
+    }
+
     /// Maps credential service names to friendly profile names. The CLI derives
     /// each profile's keychain suffix from sha256(CLAUDE_CONFIG_DIR)[0..<8], so
     /// hashing the ~/.claude-* directories recovers the dir behind each item.
