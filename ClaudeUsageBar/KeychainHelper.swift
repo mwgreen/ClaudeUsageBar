@@ -24,9 +24,15 @@ enum KeychainError: Error, LocalizedError {
 
 struct ClaudeCredentials {
     var accessToken: String
-    var refreshToken: String
-    /// Absolute expiration time. The keychain stores this as milliseconds since epoch.
-    var expiresAt: Date
+    /// Absolute expiration time; the keychain stores it as milliseconds since
+    /// epoch. Nil when the stored blob had no recognizable expiry, in which case
+    /// the token is tried and the API's answer decides.
+    var expiresAt: Date?
+
+    var isUsable: Bool {
+        guard let expiresAt else { return true }
+        return expiresAt > Date()
+    }
 }
 
 struct KeychainHelper {
@@ -93,89 +99,39 @@ struct KeychainHelper {
         return map
     }
 
-    /// Reads the full Claude Code credential blob. Falls back to searching any
-    /// string that looks like an access token if the JSON shape is unexpected,
-    /// in which case refreshToken/expiresAt are empty/distant-past and callers
-    /// must treat the token as non-refreshable.
+    /// Reads the access token and expiry from the Claude Code credential blob.
+    /// Falls back to searching any string that looks like an access token if the
+    /// JSON shape is unexpected, in which case the expiry is unknown.
     static func readCredentials(service: String) throws -> ClaudeCredentials {
         let data = try readKeychainData(service: service)
 
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             if let raw = String(data: data, encoding: .utf8),
                let token = extractAccessToken(from: raw) {
-                return ClaudeCredentials(accessToken: token, refreshToken: "", expiresAt: .distantPast)
+                return ClaudeCredentials(accessToken: token, expiresAt: nil)
             }
             throw KeychainError.unexpectedData
         }
 
-        // Claude Code wraps the user credential under "claudeAiOauth"; sibling keys
-        // like "mcpOAuth" hold other entries and must be preserved on write-back.
+        // Claude Code wraps the user credential under "claudeAiOauth"; sibling
+        // keys like "mcpOAuth" hold other entries.
         let creds = (root["claudeAiOauth"] as? [String: Any]) ?? root
 
         if let access = creds["accessToken"] as? String, !access.isEmpty {
-            let refresh = (creds["refreshToken"] as? String) ?? ""
-            let expiresAt: Date
+            var expiresAt: Date?
             if let ms = creds["expiresAt"] as? Double {
                 expiresAt = Date(timeIntervalSince1970: ms / 1000.0)
             } else if let ms = creds["expiresAt"] as? Int {
                 expiresAt = Date(timeIntervalSince1970: TimeInterval(ms) / 1000.0)
-            } else {
-                expiresAt = .distantPast
             }
-            return ClaudeCredentials(accessToken: access, refreshToken: refresh, expiresAt: expiresAt)
+            return ClaudeCredentials(accessToken: access, expiresAt: expiresAt)
         }
 
         if let token = findAccessToken(in: root) {
-            return ClaudeCredentials(accessToken: token, refreshToken: "", expiresAt: .distantPast)
+            return ClaudeCredentials(accessToken: token, expiresAt: nil)
         }
 
         throw KeychainError.noTokenField
-    }
-
-    /// Writes updated tokens back to the keychain, preserving the rest of the
-    /// stored JSON (e.g. mcpOAuth, subscriptionType, scopes) so Claude CLI is
-    /// not disrupted.
-    static func writeBackCredentials(service: String, accessToken: String, refreshToken: String, expiresAt: Date) throws {
-        let existing = try readKeychainData(service: service)
-
-        guard var root = try? JSONSerialization.jsonObject(with: existing) as? [String: Any] else {
-            throw KeychainError.unexpectedData
-        }
-
-        let expiresMs = Int(expiresAt.timeIntervalSince1970 * 1000)
-
-        if var wrapper = root["claudeAiOauth"] as? [String: Any] {
-            wrapper["accessToken"] = accessToken
-            wrapper["refreshToken"] = refreshToken
-            wrapper["expiresAt"] = expiresMs
-            root["claudeAiOauth"] = wrapper
-        } else {
-            root["accessToken"] = accessToken
-            root["refreshToken"] = refreshToken
-            root["expiresAt"] = expiresMs
-        }
-
-        let updated = try JSONSerialization.data(withJSONObject: root, options: [])
-        guard let updatedString = String(data: updated, encoding: .utf8) else {
-            throw KeychainError.unexpectedData
-        }
-
-        // Claude Code CLI writes/reads via /usr/bin/security, which leaves the item's
-        // ACL allowing only `security` to decrypt. Updating via Security.framework
-        // from this app fails with errSecAuthFailed because the bundle isn't in the
-        // ACL — and re-granting requires the user's password (apple-tool partition).
-        // Shell out instead: `security` is in the ACL and the "encrypt" entry is
-        // unrestricted, so updates go through without prompting.
-        let result = runSecurity([
-            "add-generic-password",
-            "-s", service,
-            "-a", NSUserName(),
-            "-w", updatedString,
-            "-U"
-        ])
-        if result.exitCode != 0 {
-            throw KeychainError.securityError(result.exitCode, result.stderr)
-        }
     }
 
     private static func readKeychainData(service: String) throws -> Data {

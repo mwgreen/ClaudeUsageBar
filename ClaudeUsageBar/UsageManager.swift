@@ -5,9 +5,6 @@ import os
 enum APIError: LocalizedError {
     case rateLimited
     case httpError(statusCode: Int, body: String)
-    case oauthRefreshFailed(statusCode: Int, body: String)
-    /// The token endpoint rate-limited a refresh recently; no request was made.
-    case refreshBackingOff(until: Date)
 
     var errorDescription: String? {
         switch self {
@@ -16,12 +13,17 @@ enum APIError: LocalizedError {
         case .httpError(let statusCode, let body):
             let truncated = body.count > 200 ? String(body.prefix(200)) + "…" : body
             return "HTTP \(statusCode): \(truncated)"
-        case .oauthRefreshFailed(let statusCode, let body):
-            let truncated = body.count > 200 ? String(body.prefix(200)) + "…" : body
-            return "OAuth refresh failed (\(statusCode)): \(truncated)"
-        case .refreshBackingOff(let until):
-            let minutes = max(1, Int((until.timeIntervalSinceNow / 60).rounded(.up)))
-            return "Token refresh rate-limited; retrying in \(minutes) min"
+        }
+    }
+}
+
+/// The Keychain holds a login, but its access token is past its expiry.
+enum CredentialError: LocalizedError {
+    case expired
+
+    var errorDescription: String? {
+        switch self {
+        case .expired: return "stored access token is past its expiry"
         }
     }
 }
@@ -32,12 +34,18 @@ final class UsageManager: ObservableObject {
     @Published var errorMessage: String?
     @Published var lastUpdated: Date?
     @Published var isStale: Bool = false
-    /// Non-nil when this profile has no usable login: the Keychain item is gone
-    /// (`claude logout` deletes it) or the token expired and could not be
-    /// refreshed. The account is hidden from the menu bar until a login reappears.
+    /// Non-nil when this profile has no usable login, which hides the account
+    /// from the menu bar: the Keychain item is gone (`claude logout` deletes
+    /// it) or its access token has expired. The app never refreshes tokens
+    /// itself (see `usableCredentials`), so an expired token stays unusable
+    /// until the CLI refreshes it, which any `claude` command under that
+    /// profile does; the row returns on the next poll after that.
     @Published var loggedOutReason: String?
 
     var isLoggedOut: Bool { loggedOutReason != nil }
+
+    static let notLoggedInReason = "Not logged in"
+    static let tokenExpiredReason = "Token expired \u{2014} run any claude command under this profile to refresh it"
 
     /// Keychain service name of the credential item this instance tracks.
     let service: String
@@ -48,44 +56,11 @@ final class UsageManager: ObservableObject {
     private var claudeVersion: String = "2.0.31"
     private var consecutiveFailures: Int = 0
     private let maxFailuresBeforeStale: Int = 3 // ~15 min at 5-min intervals
-    /// Consecutive refresh attempts the OAuth token endpoint answered but
-    /// refused (any HTTP status); polls skipped by the backoff below don't
-    /// count or reset it. A single refusal may be transient, but a run of them
-    /// with an expired access token means the refresh token is dead — e.g.
-    /// revoked by a login elsewhere, which the server has been seen to answer
-    /// with 429 indefinitely — so the account is treated as logged out rather
-    /// than flagged with "!" forever.
-    private var consecutiveRefreshRefusals: Int = 0
-    private let maxRefreshRefusalsBeforeLoggedOut: Int = 3 // ~40 min of 429s, given the backoff
-
-    /// Exponential backoff for the OAuth token endpoint. Retrying a 429'd
-    /// refresh on every 5-minute poll kept one account throttled for a week;
-    /// after a 429 the next attempt waits 10, 20, 40 … minutes, capped at an
-    /// hour. Every poll still re-reads the Keychain, so a token the CLI refreshed
-    /// in the meantime is used at once and clears the backoff.
-    private var refreshBackoffUntil: Date?
-    private var refreshBackoffStep: Int = 0
-    private let refreshBackoffBase: TimeInterval = 600 // 10 minutes
-    private let refreshBackoffMax: TimeInterval = 3600 // 1 hour
 
     /// Poll outcomes go to the unified log as public messages (NSLog text is
     /// redacted to <private> there):
     ///   /usr/bin/log show --predicate 'subsystem == "com.mwgreen.ClaudeUsageBar"' --last 1h
     private let log = Logger(subsystem: "com.mwgreen.ClaudeUsageBar", category: "usage")
-
-    // Claude Code's public OAuth client. Same ID used by the CLI.
-    private let oauthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    /// Token endpoint and request shape mirror Claude Code 2.1.x: JSON body
-    /// with the CLI's default scopes on platform.claude.com. The old
-    /// form-encoded POST to claude.ai/v1/oauth/token answered every refresh
-    /// with 429 even though the CLI refreshed the same token fine.
-    private let oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
-    private let oauthScopes = [
-        "user:profile", "user:inference", "user:sessions:claude_code",
-        "user:mcp_servers", "user:file_upload"
-    ]
-    /// Refresh proactively if the access token expires within this window.
-    private let refreshSkew: TimeInterval = 60
 
     init(service: String) {
         self.service = service
@@ -107,21 +82,23 @@ final class UsageManager: ObservableObject {
     func refresh() async {
         claudeVersion = detectClaudeCodeVersion() ?? "2.0.31"
         do {
-            let creds = try await ensureFreshCredentials()
+            let creds = try usableCredentials()
             let data = try await fetchUsage(token: creds.accessToken)
             try applySuccessfulFetch(data)
         } catch let error as URLError where error.code == .userAuthenticationRequired {
-            // Access token was rejected despite passing the expiry check — force
-            // a refresh and retry once. If that fails too, surface the error.
+            // The API rejected a token that looked unexpired. Re-read the
+            // Keychain once in case the CLI rotated it since we cached it; if
+            // the stored token is still refused, treat it as expired.
+            cachedCreds = nil
             do {
-                let refreshed = try await forceRefreshCredentials()
-                let data = try await fetchUsage(token: refreshed.accessToken)
+                let creds = try usableCredentials()
+                let data = try await fetchUsage(token: creds.accessToken)
                 try applySuccessfulFetch(data)
             } catch {
-                handleRefreshFailure(error: error)
+                handleFailure(error: error)
             }
         } catch {
-            handleRefreshFailure(error: error)
+            handleFailure(error: error)
         }
     }
 
@@ -133,16 +110,19 @@ final class UsageManager: ObservableObject {
         loggedOutReason = nil
         lastUpdated = Date()
         consecutiveFailures = 0
-        consecutiveRefreshRefusals = 0
-        // The backoff is only armed once the token has expired, so a successful
-        // fetch means a fresh token arrived (usually the CLI's refresh, read back
-        // from the Keychain); start the next throttling episode at 10 minutes.
-        refreshBackoffUntil = nil
-        refreshBackoffStep = 0
         isStale = false
     }
 
-    private func ensureFreshCredentials() async throws -> ClaudeCredentials {
+    /// The token the CLI stored, provided it is still valid.
+    ///
+    /// The app deliberately never calls the OAuth token endpoint. It refused
+    /// this app's refreshes outright (429 on the first attempt) while the CLI
+    /// refreshed the very same token without trouble, and a refresh that did
+    /// succeed would rotate the refresh token underneath a running CLI session.
+    /// So the app is a read-only consumer of the CLI's tokens: it re-reads the
+    /// Keychain whenever the cached token is expired, and a token the CLI has
+    /// refreshed in the meantime is used on the next poll.
+    private func usableCredentials() throws -> ClaudeCredentials {
         // Attributes-only existence check (no decrypt, so no ACL prompt) so that
         // `claude logout`, which deletes the item, is noticed on the next poll
         // even while a cached access token would still be accepted by the API.
@@ -150,111 +130,19 @@ final class UsageManager: ObservableObject {
             cachedCreds = nil
             throw KeychainError.itemNotFound
         }
-        if cachedCreds == nil {
-            cachedCreds = try KeychainHelper.readCredentials(service: service)
-        }
-        guard var creds = cachedCreds else { throw KeychainError.itemNotFound }
-
-        if creds.expiresAt.timeIntervalSinceNow > refreshSkew {
+        if let creds = cachedCreds, creds.isUsable {
             return creds
         }
-
-        // Re-read keychain first in case another Claude Code instance just refreshed.
-        creds = try KeychainHelper.readCredentials(service: service)
+        let creds = try KeychainHelper.readCredentials(service: service)
         cachedCreds = creds
-        if creds.expiresAt.timeIntervalSinceNow > refreshSkew {
-            return creds
-        }
-
-        return try await forceRefreshCredentials()
+        guard creds.isUsable else { throw CredentialError.expired }
+        return creds
     }
 
-    private func forceRefreshCredentials() async throws -> ClaudeCredentials {
-        let current: ClaudeCredentials
-        if let cached = cachedCreds {
-            current = cached
-        } else {
-            current = try KeychainHelper.readCredentials(service: service)
-        }
-        guard !current.refreshToken.isEmpty else {
-            throw URLError(.userAuthenticationRequired)
-        }
-        if let until = refreshBackoffUntil, until > Date() {
-            throw APIError.refreshBackingOff(until: until)
-        }
-
-        let refreshed = try await performOAuthRefresh(refreshToken: current.refreshToken)
-        refreshBackoffUntil = nil
-        refreshBackoffStep = 0
-        try KeychainHelper.writeBackCredentials(
-            service: service,
-            accessToken: refreshed.accessToken,
-            refreshToken: refreshed.refreshToken,
-            expiresAt: refreshed.expiresAt
-        )
-        cachedCreds = refreshed
-        return refreshed
-    }
-
-    private func performOAuthRefresh(refreshToken: String) async throws -> ClaudeCredentials {
-        guard let url = URL(string: oauthTokenURL) else {
-            throw URLError(.badURL)
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("claude-code/\(claudeVersion)", forHTTPHeaderField: "User-Agent")
-
-        let body: [String: String] = [
-            "grant_type": "refresh_token",
-            "refresh_token": refreshToken,
-            "client_id": oauthClientId,
-            "scope": oauthScopes.joined(separator: " ")
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw URLError(.badServerResponse)
-        }
-        guard (200...299).contains(http.statusCode) else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw APIError.oauthRefreshFailed(statusCode: http.statusCode, body: body)
-        }
-
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let access = json["access_token"] as? String else {
-            throw APIError.oauthRefreshFailed(statusCode: http.statusCode, body: "no access_token in response")
-        }
-        let newRefresh = (json["refresh_token"] as? String) ?? refreshToken
-        let expiresIn = (json["expires_in"] as? Double) ?? 36_000
-        return ClaudeCredentials(
-            accessToken: access,
-            refreshToken: newRefresh,
-            expiresAt: Date().addingTimeInterval(expiresIn)
-        )
-    }
-
-    private func handleRefreshFailure(error: Error) {
-        switch error as? APIError {
-        case .oauthRefreshFailed(let status, _)?:
-            consecutiveRefreshRefusals += 1
-            // Arm (or lengthen) the backoff so the next polls skip the token
-            // endpoint instead of hammering it while it is throttling us. Done
-            // before the logged-out check so the refusal that hides the row
-            // still pushes the next attempt back.
-            if status == 429 { armRefreshBackoff() }
-        case .refreshBackingOff?:
-            break // no request was made; the run of refusals continues
-        default:
-            consecutiveRefreshRefusals = 0
-        }
-
-        // A missing or unusable login isn't an error to flag — the profile is
-        // logged out (or its login expired). Hide it until a fresh login shows
-        // up in the Keychain; clearing the cache makes the next poll re-read it.
+    private func handleFailure(error: Error) {
+        // A missing or expired login isn't an error to flag — the row is hidden
+        // until a usable token shows up in the Keychain. Clearing the cache
+        // makes the next poll re-read it.
         if let reason = loggedOutReason(for: error) {
             log.notice("[\(self.service, privacy: .public)] \(reason, privacy: .public): \(error.localizedDescription, privacy: .public)")
             loggedOutReason = reason
@@ -263,36 +151,22 @@ final class UsageManager: ObservableObject {
             errorMessage = nil
             cachedCreds = nil
             consecutiveFailures = 0
-            consecutiveRefreshRefusals = 0
             return
         }
 
-        log.error("[\(self.service, privacy: .public)] refresh failed: \(error.localizedDescription, privacy: .public)")
+        log.error("[\(self.service, privacy: .public)] fetch failed: \(error.localizedDescription, privacy: .public)")
         consecutiveFailures += 1
 
         // 429 is rate limiting — keep showing last-known data as stale.
         // Don't clear the cached token: rate limiting doesn't mean the token is
         // invalid, and clearing it forces a Keychain read that can trigger a
         // macOS password prompt (blocking all refreshes if the user is away).
-        if let apiError = error as? APIError {
-            switch apiError {
-            case .rateLimited:
-                if usage != nil {
-                    self.isStale = true
-                    self.errorMessage = nil // cached data IS the display, not an error
-                }
-                return
-            case .oauthRefreshFailed(429, _), .refreshBackingOff:
-                if usage != nil {
-                    self.isStale = true
-                    self.errorMessage = nil
-                } else {
-                    self.errorMessage = APIError.refreshBackingOff(until: refreshBackoffUntil ?? Date()).localizedDescription
-                }
-                return
-            default:
-                break
+        if let apiError = error as? APIError, case .rateLimited = apiError {
+            if usage != nil {
+                self.isStale = true
+                self.errorMessage = nil // cached data IS the display, not an error
             }
+            return
         }
 
         self.errorMessage = error.localizedDescription
@@ -309,33 +183,22 @@ final class UsageManager: ObservableObject {
         }
     }
 
-    private func armRefreshBackoff() {
-        let delay = min(refreshBackoffBase * pow(2, Double(refreshBackoffStep)), refreshBackoffMax)
-        refreshBackoffStep += 1
-        refreshBackoffUntil = Date().addingTimeInterval(delay)
-        log.notice("[\(self.service, privacy: .public)] token refresh backing off for \(Int(delay / 60)) min")
-    }
-
     /// Classifies errors that mean "no usable login" rather than a transient
-    /// failure: no credential item (or one without a token), an OAuth refresh the
-    /// server rejected as invalid, a refresh the server has refused on several
-    /// consecutive polls regardless of status, or an access token the API still
-    /// refuses after a forced refresh. Network errors, and 5xx/429 from the usage
-    /// endpoint, are not included.
+    /// failure: no credential item (or one without a token), an access token
+    /// past its stored expiry, or one the API refuses even after re-reading the
+    /// Keychain. Network errors, 5xx and 429 are not included.
     private func loggedOutReason(for error: Error) -> String? {
         if let keychainError = error as? KeychainError {
             switch keychainError {
-            case .itemNotFound, .noTokenField: return "Not logged in"
+            case .itemNotFound, .noTokenField: return Self.notLoggedInReason
             default: return nil
             }
         }
-        if let apiError = error as? APIError,
-           case .oauthRefreshFailed(let status, _) = apiError {
-            if [400, 401, 403].contains(status) { return "Login expired" }
-            if consecutiveRefreshRefusals >= maxRefreshRefusalsBeforeLoggedOut { return "Login expired" }
+        if error is CredentialError {
+            return Self.tokenExpiredReason
         }
         if let urlError = error as? URLError, urlError.code == .userAuthenticationRequired {
-            return "Login expired"
+            return Self.tokenExpiredReason
         }
         return nil
     }
