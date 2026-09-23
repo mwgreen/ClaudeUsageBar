@@ -6,6 +6,8 @@ enum APIError: LocalizedError {
     case rateLimited
     case httpError(statusCode: Int, body: String)
     case oauthRefreshFailed(statusCode: Int, body: String)
+    /// The token endpoint rate-limited a refresh recently; no request was made.
+    case refreshBackingOff(until: Date)
 
     var errorDescription: String? {
         switch self {
@@ -17,6 +19,9 @@ enum APIError: LocalizedError {
         case .oauthRefreshFailed(let statusCode, let body):
             let truncated = body.count > 200 ? String(body.prefix(200)) + "…" : body
             return "OAuth refresh failed (\(statusCode)): \(truncated)"
+        case .refreshBackingOff(let until):
+            let minutes = max(1, Int((until.timeIntervalSinceNow / 60).rounded(.up)))
+            return "Token refresh rate-limited; retrying in \(minutes) min"
         }
     }
 }
@@ -44,6 +49,16 @@ final class UsageManager: ObservableObject {
     private var consecutiveFailures: Int = 0
     private let maxFailuresBeforeStale: Int = 3 // ~15 min at 5-min intervals
 
+    /// Exponential backoff for the OAuth token endpoint. Retrying a 429'd
+    /// refresh on every 5-minute poll kept one account throttled for a week;
+    /// after a 429 the next attempt waits 10, 20, 40 … minutes, capped at an
+    /// hour. Every poll still re-reads the Keychain, so a token the CLI refreshed
+    /// in the meantime is used at once and clears the backoff.
+    private var refreshBackoffUntil: Date?
+    private var refreshBackoffStep: Int = 0
+    private let refreshBackoffBase: TimeInterval = 600 // 10 minutes
+    private let refreshBackoffMax: TimeInterval = 3600 // 1 hour
+
     /// Poll outcomes go to the unified log as public messages (NSLog text is
     /// redacted to <private> there):
     ///   /usr/bin/log show --predicate 'subsystem == "com.mwgreen.ClaudeUsageBar"' --last 1h
@@ -51,7 +66,15 @@ final class UsageManager: ObservableObject {
 
     // Claude Code's public OAuth client. Same ID used by the CLI.
     private let oauthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    private let oauthTokenURL = "https://claude.ai/v1/oauth/token"
+    /// Token endpoint and request shape mirror Claude Code 2.1.x: JSON body
+    /// with the CLI's default scopes on platform.claude.com. The old
+    /// form-encoded POST to claude.ai/v1/oauth/token answered every refresh
+    /// with 429 even though the CLI refreshed the same token fine.
+    private let oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
+    private let oauthScopes = [
+        "user:profile", "user:inference", "user:sessions:claude_code",
+        "user:mcp_servers", "user:file_upload"
+    ]
     /// Refresh proactively if the access token expires within this window.
     private let refreshSkew: TimeInterval = 60
 
@@ -141,8 +164,13 @@ final class UsageManager: ObservableObject {
         guard !current.refreshToken.isEmpty else {
             throw URLError(.userAuthenticationRequired)
         }
+        if let until = refreshBackoffUntil, until > Date() {
+            throw APIError.refreshBackingOff(until: until)
+        }
 
         let refreshed = try await performOAuthRefresh(refreshToken: current.refreshToken)
+        refreshBackoffUntil = nil
+        refreshBackoffStep = 0
         try KeychainHelper.writeBackCredentials(
             service: service,
             accessToken: refreshed.accessToken,
@@ -160,17 +188,17 @@ final class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("claude-code/\(claudeVersion)", forHTTPHeaderField: "User-Agent")
 
-        var components = URLComponents()
-        components.queryItems = [
-            URLQueryItem(name: "grant_type", value: "refresh_token"),
-            URLQueryItem(name: "client_id", value: oauthClientId),
-            URLQueryItem(name: "refresh_token", value: refreshToken)
+        let body: [String: String] = [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": oauthClientId,
+            "scope": oauthScopes.joined(separator: " ")
         ]
-        request.httpBody = components.percentEncodedQuery?.data(using: .utf8)
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -216,12 +244,33 @@ final class UsageManager: ObservableObject {
         // Don't clear the cached token: rate limiting doesn't mean the token is
         // invalid, and clearing it forces a Keychain read that can trigger a
         // macOS password prompt (blocking all refreshes if the user is away).
-        if let apiError = error as? APIError, case .rateLimited = apiError {
-            if usage != nil {
-                self.isStale = true
-                self.errorMessage = nil // cached data IS the display, not an error
+        if let apiError = error as? APIError {
+            switch apiError {
+            case .rateLimited:
+                if usage != nil {
+                    self.isStale = true
+                    self.errorMessage = nil // cached data IS the display, not an error
+                }
+                return
+            case .oauthRefreshFailed(let status, _) where status == 429:
+                // Arm (or lengthen) the backoff so the next polls skip the token
+                // endpoint instead of hammering it while it is throttling us.
+                let delay = min(refreshBackoffBase * pow(2, Double(refreshBackoffStep)), refreshBackoffMax)
+                refreshBackoffStep += 1
+                refreshBackoffUntil = Date().addingTimeInterval(delay)
+                log.notice("[\(self.service, privacy: .public)] token refresh backing off for \(Int(delay / 60)) min")
+                fallthrough
+            case .refreshBackingOff:
+                if usage != nil {
+                    self.isStale = true
+                    self.errorMessage = nil
+                } else {
+                    self.errorMessage = APIError.refreshBackingOff(until: refreshBackoffUntil ?? Date()).localizedDescription
+                }
+                return
+            default:
+                break
             }
-            return
         }
 
         self.errorMessage = error.localizedDescription
