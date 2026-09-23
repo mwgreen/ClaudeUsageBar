@@ -134,6 +134,11 @@ final class UsageManager: ObservableObject {
         lastUpdated = Date()
         consecutiveFailures = 0
         consecutiveRefreshRefusals = 0
+        // The backoff is only armed once the token has expired, so a successful
+        // fetch means a fresh token arrived (usually the CLI's refresh, read back
+        // from the Keychain); start the next throttling episode at 10 minutes.
+        refreshBackoffUntil = nil
+        refreshBackoffStep = 0
         isStale = false
     }
 
