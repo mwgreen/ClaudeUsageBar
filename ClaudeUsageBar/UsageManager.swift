@@ -48,6 +48,15 @@ final class UsageManager: ObservableObject {
     private var claudeVersion: String = "2.0.31"
     private var consecutiveFailures: Int = 0
     private let maxFailuresBeforeStale: Int = 3 // ~15 min at 5-min intervals
+    /// Consecutive refresh attempts the OAuth token endpoint answered but
+    /// refused (any HTTP status); polls skipped by the backoff below don't
+    /// count or reset it. A single refusal may be transient, but a run of them
+    /// with an expired access token means the refresh token is dead — e.g.
+    /// revoked by a login elsewhere, which the server has been seen to answer
+    /// with 429 indefinitely — so the account is treated as logged out rather
+    /// than flagged with "!" forever.
+    private var consecutiveRefreshRefusals: Int = 0
+    private let maxRefreshRefusalsBeforeLoggedOut: Int = 3 // ~40 min of 429s, given the backoff
 
     /// Exponential backoff for the OAuth token endpoint. Retrying a 429'd
     /// refresh on every 5-minute poll kept one account throttled for a week;
@@ -124,6 +133,7 @@ final class UsageManager: ObservableObject {
         loggedOutReason = nil
         lastUpdated = Date()
         consecutiveFailures = 0
+        consecutiveRefreshRefusals = 0
         isStale = false
     }
 
@@ -223,6 +233,20 @@ final class UsageManager: ObservableObject {
     }
 
     private func handleRefreshFailure(error: Error) {
+        switch error as? APIError {
+        case .oauthRefreshFailed(let status, _)?:
+            consecutiveRefreshRefusals += 1
+            // Arm (or lengthen) the backoff so the next polls skip the token
+            // endpoint instead of hammering it while it is throttling us. Done
+            // before the logged-out check so the refusal that hides the row
+            // still pushes the next attempt back.
+            if status == 429 { armRefreshBackoff() }
+        case .refreshBackingOff?:
+            break // no request was made; the run of refusals continues
+        default:
+            consecutiveRefreshRefusals = 0
+        }
+
         // A missing or unusable login isn't an error to flag — the profile is
         // logged out (or its login expired). Hide it until a fresh login shows
         // up in the Keychain; clearing the cache makes the next poll re-read it.
@@ -234,6 +258,7 @@ final class UsageManager: ObservableObject {
             errorMessage = nil
             cachedCreds = nil
             consecutiveFailures = 0
+            consecutiveRefreshRefusals = 0
             return
         }
 
@@ -252,15 +277,7 @@ final class UsageManager: ObservableObject {
                     self.errorMessage = nil // cached data IS the display, not an error
                 }
                 return
-            case .oauthRefreshFailed(let status, _) where status == 429:
-                // Arm (or lengthen) the backoff so the next polls skip the token
-                // endpoint instead of hammering it while it is throttling us.
-                let delay = min(refreshBackoffBase * pow(2, Double(refreshBackoffStep)), refreshBackoffMax)
-                refreshBackoffStep += 1
-                refreshBackoffUntil = Date().addingTimeInterval(delay)
-                log.notice("[\(self.service, privacy: .public)] token refresh backing off for \(Int(delay / 60)) min")
-                fallthrough
-            case .refreshBackingOff:
+            case .oauthRefreshFailed(429, _), .refreshBackingOff:
                 if usage != nil {
                     self.isStale = true
                     self.errorMessage = nil
@@ -287,10 +304,19 @@ final class UsageManager: ObservableObject {
         }
     }
 
+    private func armRefreshBackoff() {
+        let delay = min(refreshBackoffBase * pow(2, Double(refreshBackoffStep)), refreshBackoffMax)
+        refreshBackoffStep += 1
+        refreshBackoffUntil = Date().addingTimeInterval(delay)
+        log.notice("[\(self.service, privacy: .public)] token refresh backing off for \(Int(delay / 60)) min")
+    }
+
     /// Classifies errors that mean "no usable login" rather than a transient
     /// failure: no credential item (or one without a token), an OAuth refresh the
-    /// server rejected as invalid, or an access token the API still refuses
-    /// after a forced refresh. Network errors, 5xx and 429 are not included.
+    /// server rejected as invalid, a refresh the server has refused on several
+    /// consecutive polls regardless of status, or an access token the API still
+    /// refuses after a forced refresh. Network errors, and 5xx/429 from the usage
+    /// endpoint, are not included.
     private func loggedOutReason(for error: Error) -> String? {
         if let keychainError = error as? KeychainError {
             switch keychainError {
@@ -299,9 +325,9 @@ final class UsageManager: ObservableObject {
             }
         }
         if let apiError = error as? APIError,
-           case .oauthRefreshFailed(let status, _) = apiError,
-           [400, 401, 403].contains(status) {
-            return "Login expired"
+           case .oauthRefreshFailed(let status, _) = apiError {
+            if [400, 401, 403].contains(status) { return "Login expired" }
+            if consecutiveRefreshRefusals >= maxRefreshRefusalsBeforeLoggedOut { return "Login expired" }
         }
         if let urlError = error as? URLError, urlError.code == .userAuthenticationRequired {
             return "Login expired"
