@@ -13,8 +13,11 @@
 Description=ClaudeUsageBar usage server (serves this host's Claude usage on 127.0.0.1:7103)
 
 [Service]
-ExecStart=/usr/bin/python3 %h/git-repos/ClaudeUsageBar/usage-server/claude_usage_server.py --port 7103
-# So the server can find `claude` for the User-Agent version.
+# --keep-token-fresh lets the server run a tiny `claude -p` (Haiku) call when
+# the stored token expires, so usage keeps flowing when claude isn't otherwise
+# used here. Drop it to only report token_expired instead.
+ExecStart=/usr/bin/python3 %h/git-repos/ClaudeUsageBar/usage-server/claude_usage_server.py --port 7103 --keep-token-fresh
+# So the server can find `claude` (User-Agent version, --keep-token-fresh).
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=10

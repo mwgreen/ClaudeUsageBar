@@ -11,9 +11,12 @@ through an SSH local forward such as
 
     ssh -N -L 127.0.0.1:7103:127.0.0.1:7103 <this-host>
 
-Like the app, it never refreshes tokens: the CLI refreshes its own token on
-use, and a refresh from here would rotate the refresh token underneath a
-running CLI session. When the stored token has expired it answers
+Like the app, it never calls the OAuth token endpoint itself: a refresh from
+here would rotate the refresh token underneath a running CLI session. The CLI
+refreshes its own token whenever it runs, so with --keep-token-fresh the
+server runs one tiny `claude -p` call (Haiku, no saved session) when the
+stored token is expired or about to expire, at most once per 10 minutes, and
+lets the CLI do the refresh. Without it, an expired token answers
 token_expired until any `claude` command on this host has refreshed it.
 
 Endpoints:
@@ -44,6 +47,11 @@ DEFAULT_CLAUDE_VERSION = "2.0.31"
 # Answers are reused this long so a burst of refreshes is one upstream call.
 CACHE_SECONDS = 30
 VERSION_CHECK_SECONDS = 3600
+# --keep-token-fresh nudges the CLI when the token has this long left...
+NUDGE_MARGIN_SECONDS = 300
+# ...and tries again no sooner than this if the nudge didn't refresh it.
+NUDGE_RETRY_SECONDS = 600
+NUDGE_COMMAND = ["claude", "-p", "OK", "--model", "haiku", "--no-session-persistence"]
 
 
 class UsageError(Exception):
@@ -59,8 +67,8 @@ def credentials_path():
     return Path(config_dir).expanduser() / ".credentials.json"
 
 
-def read_access_token():
-    """The CLI's stored access token, provided it has not expired."""
+def read_credentials():
+    """The CLI's stored access token and its expiry (epoch seconds, or None)."""
     path = credentials_path()
     try:
         root = json.loads(path.read_text())
@@ -74,9 +82,20 @@ def read_access_token():
     if not token:
         raise UsageError(503, "not_logged_in", f"no access token in {path}")
     expires_ms = creds.get("expiresAt")
-    if isinstance(expires_ms, (int, float)) and expires_ms / 1000 <= time.time():
-        raise UsageError(503, "token_expired", "stored access token is past its expiry")
-    return token
+    expires = expires_ms / 1000 if isinstance(expires_ms, (int, float)) else None
+    return token, expires
+
+
+def nudge_cli():
+    """Runs a minimal `claude` call so the CLI refreshes its own stored token."""
+    log("token expired or expiring; running claude so it refreshes its login")
+    try:
+        result = subprocess.run(NUDGE_COMMAND, capture_output=True, text=True,
+                                timeout=120, stdin=subprocess.DEVNULL, cwd=Path.home())
+        if result.returncode != 0:
+            log(f"claude exited {result.returncode}: {result.stderr.strip()[:200]}")
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"could not run claude: {e}")
 
 
 class ClaudeVersion:
@@ -123,17 +142,31 @@ def fetch_usage(token, claude_version):
 
 
 class UsageSource:
-    def __init__(self):
+    def __init__(self, keep_token_fresh):
         self._lock = threading.Lock()
         self._version = ClaudeVersion()
-        self._cached = None  # (time, status, content_type, body)
+        self._cached = None  # (time, status, body)
+        self._keep_token_fresh = keep_token_fresh
+        self._last_nudge = 0.0
+
+    def _access_token(self):
+        token, expires = read_credentials()
+        if (self._keep_token_fresh and expires is not None
+                and expires - time.time() < NUDGE_MARGIN_SECONDS
+                and time.time() - self._last_nudge > NUDGE_RETRY_SECONDS):
+            self._last_nudge = time.time()
+            nudge_cli()
+            token, expires = read_credentials()
+        if expires is not None and expires <= time.time():
+            raise UsageError(503, "token_expired", "stored access token is past its expiry")
+        return token
 
     def answer(self):
         with self._lock:
             if self._cached and time.time() - self._cached[0] < CACHE_SECONDS:
                 return self._cached[1:]
             try:
-                body = fetch_usage(read_access_token(), self._version.get())
+                body = fetch_usage(self._access_token(), self._version.get())
                 result = (200, body)
             except UsageError as e:
                 log(f"usage {e.code}: {e.message}")
@@ -174,9 +207,13 @@ def main():
     parser.add_argument("--host", default="127.0.0.1",
                         help="address to bind (default 127.0.0.1; keep it loopback)")
     parser.add_argument("--port", type=int, default=7103, help="port (default 7103)")
+    parser.add_argument("--keep-token-fresh", action="store_true",
+                        help="run a tiny `claude -p` call when the stored token expires, "
+                             "so the CLI refreshes it (uses a negligible amount of usage)")
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(UsageSource()))
+    source = UsageSource(keep_token_fresh=args.keep_token_fresh)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(source))
     log(f"serving usage for {credentials_path()} on http://{args.host}:{args.port}/usage")
     try:
         server.serve_forever()
