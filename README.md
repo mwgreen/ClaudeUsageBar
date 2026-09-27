@@ -22,7 +22,7 @@ defaults write com.mwgreen.ClaudeUsageBar AccountWService "Claude Code-credentia
 
 ## Remote accounts
 
-An account slot can point at a **usage server** instead of a Keychain item, so this Mac shows an account's usage without ever holding its login. `usage-server/claude_usage_server.py` (Python 3, standard library only) runs on the host where that account is logged in, e.g. a Linux VM. It reads the CLI's stored token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`), calls the usage endpoint itself, and answers `GET /usage` with the endpoint's JSON unchanged. The token never leaves that host. Like the app, the server never refreshes tokens; when the stored one has expired it answers `token_expired` until any `claude` command there refreshes it.
+An account slot can point at a **usage server** instead of a Keychain item, so this Mac shows an account's usage without ever holding its login. `usage-server/claude_usage_server.py` (Python 3, standard library only) runs on the host where that account is logged in, e.g. a Linux VM. It reads the CLI's stored token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`), calls the usage endpoint itself, and answers `GET /usage` with the endpoint's JSON unchanged. The token never leaves that host. Like the app, the server never calls the OAuth token endpoint. With `--keep-token-fresh` (on in the shipped systemd unit), when the stored token is expired or about to expire it runs one tiny `claude -p` Haiku call so the CLI refreshes its own login; without it, the server answers `token_expired` until any `claude` command there refreshes it.
 
 The server binds to `127.0.0.1:7103` only, and the Mac reaches it through an SSH local forward. Nothing is exposed on the network, and only a machine that can SSH into the VM can query it. On the VM:
 
@@ -41,6 +41,8 @@ On the Mac, forward the port (for the `fls-dev` VM this is a `-L 127.0.0.1:7103:
 ```sh
 defaults write com.mwgreen.ClaudeUsageBar AccountPService "http://127.0.0.1:7103/usage"
 ```
+
+To survive reboots, the VM needs to start at login (for UTM, a launch agent running `utmctl start --hide <vm>` when `utmctl status <vm>` isn't `started`), the tunnel's launch agent needs `KeepAlive`, and the VM's user services need to run without a login session (`enable-linger` above; the tunnel's own ssh session also keeps them up).
 
 A remote account behaves like a local one: `P`/`W` rows, stale marker on 429, and hidden with a reason in the dropdown when the remote host is logged out, its token has expired, or the server can't be reached (VM off, tunnel down).
 
