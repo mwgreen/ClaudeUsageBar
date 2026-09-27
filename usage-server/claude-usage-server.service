@@ -5,7 +5,10 @@
 #   cp usage-server/claude-usage-server.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now claude-usage-server
-#   sudo loginctl enable-linger "$USER"   # keep it running without a login session
+#
+# An SSH tunnel's session keeps user services running while it is connected.
+# Only if the server must run with no session at all:
+#   sudo loginctl enable-linger "$USER"
 #
 # ExecStart assumes the repo is cloned at ~/git-repos/ClaudeUsageBar; adjust if not.
 

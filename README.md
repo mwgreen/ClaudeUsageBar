@@ -32,7 +32,6 @@ mkdir -p ~/.config/systemd/user
 cp ~/git-repos/ClaudeUsageBar/usage-server/claude-usage-server.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now claude-usage-server
-sudo loginctl enable-linger "$USER"      # run without an open login session
 curl -s http://127.0.0.1:7103/usage      # check
 ```
 
@@ -42,7 +41,7 @@ On the Mac, forward the port (for the `fls-dev` VM this is a `-L 127.0.0.1:7103:
 defaults write com.mwgreen.ClaudeUsageBar AccountPService "http://127.0.0.1:7103/usage"
 ```
 
-To survive reboots, the VM needs to start at login (for UTM, a launch agent running `utmctl start --hide <vm>` when `utmctl status <vm>` isn't `started`), the tunnel's launch agent needs `KeepAlive`, and the VM's user services need to run without a login session (`enable-linger` above; the tunnel's own ssh session also keeps them up).
+To survive reboots, the VM needs to start at login (for UTM, a launch agent running `utmctl start --hide <vm>` when `utmctl status <vm>` isn't `started`), the tunnel's launch agent needs `KeepAlive`, and the VM's user services need to be running. The tunnel's ssh connection is a login session, which keeps them up whenever the Mac can reach the server, so `sudo loginctl enable-linger $USER` is only needed if something must reach the server without the tunnel.
 
 A remote account behaves like a local one: `P`/`W` rows, stale marker on 429, and hidden with a reason in the dropdown when the remote host is logged out, its token has expired, or the server can't be reached (VM off, tunnel down).
 
