@@ -1,6 +1,6 @@
 # ClaudeUsageBar
 
-macOS menu bar app that shows Claude Code subscription rate-limit utilization — the 5-hour session, 7-day weekly, and per-model weekly buckets reported by Anthropic's usage endpoint — for up to **two accounts**. Requires a logged-in Claude CLI: the app reads the `Claude Code-credentials` Keychain items the CLI manages (including the hash-suffixed items created per `CLAUDE_CONFIG_DIR` profile).
+macOS menu bar app that shows Claude Code subscription rate-limit utilization — the 5-hour session, 7-day weekly, and per-model weekly buckets reported by Anthropic's usage endpoint — for up to **two accounts**. Each account is either a logged-in Claude CLI on this Mac or a [remote usage server](#remote-accounts). For local accounts, the app reads the `Claude Code-credentials` Keychain items the CLI manages (including the hash-suffixed items created per `CLAUDE_CONFIG_DIR` profile).
 
 With one account, the bar shows a compact single line of percentages (`34·21·8` = 5h · 7d · per-model weekly), each number colored green / orange (≥50%) / red (≥80%). With a second account assigned, the bar stacks two small rows, prefixed `P` and `W`. If an account's fetch fails outright, its row shows a red `!` and the dropdown shows the error under that account's header. Usage polls every 5 minutes; when rate-limited, the last-known numbers stay up with a ⧖ stale marker.
 
@@ -19,6 +19,30 @@ The dropdown menu shows the full breakdown per account with reset times, plus **
 ```sh
 defaults write com.mwgreen.ClaudeUsageBar AccountWService "Claude Code-credentials-<suffix>"
 ```
+
+## Remote accounts
+
+An account slot can point at a **usage server** instead of a Keychain item, so this Mac shows an account's usage without ever holding its login. `usage-server/claude_usage_server.py` (Python 3, standard library only) runs on the host where that account is logged in, e.g. a Linux VM. It reads the CLI's stored token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`), calls the usage endpoint itself, and answers `GET /usage` with the endpoint's JSON unchanged. The token never leaves that host. Like the app, the server never refreshes tokens; when the stored one has expired it answers `token_expired` until any `claude` command there refreshes it.
+
+The server binds to `127.0.0.1:7103` only, and the Mac reaches it through an SSH local forward. Nothing is exposed on the network, and only a machine that can SSH into the VM can query it. On the VM:
+
+```sh
+git clone <this repo> ~/git-repos/ClaudeUsageBar
+mkdir -p ~/.config/systemd/user
+cp ~/git-repos/ClaudeUsageBar/usage-server/claude-usage-server.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now claude-usage-server
+sudo loginctl enable-linger "$USER"      # run without an open login session
+curl -s http://127.0.0.1:7103/usage      # check
+```
+
+On the Mac, forward the port (for the `fls-dev` VM this is a `-L 127.0.0.1:7103:127.0.0.1:7103` in the `com.mattgreen.fls-dev-rag-tunnel` launch agent), then choose **Account P: → Remote Usage Server…** (or the W submenu) and accept `http://127.0.0.1:7103/usage`. The slot's `defaults` value is then that URL instead of a Keychain service name:
+
+```sh
+defaults write com.mwgreen.ClaudeUsageBar AccountPService "http://127.0.0.1:7103/usage"
+```
+
+A remote account behaves like a local one: `P`/`W` rows, stale marker on 429, and hidden with a reason in the dropdown when the remote host is logged out, its token has expired, or the server can't be reached (VM off, tunnel down).
 
 ## Credential handling
 

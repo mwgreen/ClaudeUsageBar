@@ -53,9 +53,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusItem()
     }
 
-    /// Short display name for a credential service: the ~/.claude-* profile
-    /// dir name when one matches, otherwise the raw hash suffix.
+    /// Short display name for a slot value: "remote host:port" for a usage
+    /// server URL, the ~/.claude-* profile dir name when one matches a
+    /// credential service, otherwise the raw hash suffix.
     private func shortName(for service: String) -> String {
+        if case .remote(let url) = AccountSource(configValue: service) {
+            let host = url.host ?? url.absoluteString
+            return "remote " + (url.port.map { "\(host):\($0)" } ?? host)
+        }
         if let name = KeychainHelper.profileNames()[service] { return name }
         if service == KeychainHelper.defaultService { return "default" }
         return String(service.dropFirst(KeychainHelper.defaultService.count + 1))
@@ -313,6 +318,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.state = service == serviceP ? .on : .off
             pMenu.addItem(item)
         }
+        addRemoteItems(to: pMenu, current: serviceP, action: #selector(selectAccountP(_:)))
         let pItem = NSMenuItem(title: "Account P: \(shortName(for: serviceP))", action: nil, keyEquivalent: "")
         pItem.submenu = pMenu
 
@@ -328,10 +334,70 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.state = service == serviceW ? .on : .off
             wMenu.addItem(item)
         }
+        addRemoteItems(to: wMenu, current: serviceW, action: #selector(selectAccountW(_:)))
         let wItem = NSMenuItem(title: "Account W: \(serviceW.map(shortName(for:)) ?? "none")", action: nil, keyEquivalent: "")
         wItem.submenu = wMenu
 
         return [pItem, wItem]
+    }
+
+    /// Appends the remote-server choices to an account submenu: the slot's
+    /// current server URL (checked) when it has one, then an item that asks
+    /// for a URL. The prompt item carries no represented object.
+    private func addRemoteItems(to menu: NSMenu, current: String?, action: Selector) {
+        menu.addItem(NSMenuItem.separator())
+        if let current, case .remote = AccountSource(configValue: current) {
+            let item = NSMenuItem(title: current, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = current
+            item.state = .on
+            menu.addItem(item)
+        }
+        let promptItem = NSMenuItem(title: "Remote Usage Server\u{2026}", action: action, keyEquivalent: "")
+        promptItem.target = self
+        promptItem.representedObject = Self.remotePromptMarker
+        menu.addItem(promptItem)
+    }
+
+    private static let remotePromptMarker = "remote-prompt"
+    private static let defaultRemoteURL = "http://127.0.0.1:7103/usage"
+
+    /// Asks for a remote usage server URL. A bare http://host:port gets
+    /// /usage appended. Returns nil when cancelled or not an http(s) URL.
+    private func promptForRemoteURL(current: String?) -> String? {
+        let alert = NSAlert()
+        alert.messageText = "Remote Usage Server"
+        alert.informativeText = "URL of a usage server (usage-server/claude_usage_server.py) running where this account is logged in, typically reached through an SSH tunnel."
+        alert.addButton(withTitle: "Use Server")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        if let current, case .remote = AccountSource(configValue: current) {
+            field.stringValue = current
+        } else {
+            field.stringValue = Self.defaultRemoteURL
+        }
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+
+        var text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard case .remote(let url) = AccountSource(configValue: text) else { return nil }
+        if url.path.isEmpty || url.path == "/" {
+            text = url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/usage"
+        }
+        return text
+    }
+
+    /// The slot value a submenu item selects, prompting for a URL when it is
+    /// the remote-server item. Nil means leave the slot unchanged.
+    private func chosenValue(from sender: NSMenuItem, current: String?) -> String?? {
+        guard let value = sender.representedObject as? String else { return .some(nil) }
+        if value == Self.remotePromptMarker {
+            guard let url = promptForRemoteURL(current: current) else { return nil }
+            return .some(url)
+        }
+        return .some(value)
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -341,14 +407,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Actions
 
     @objc private func selectAccountP(_ sender: NSMenuItem) {
-        guard let service = sender.representedObject as? String, service != serviceP else { return }
+        guard case .some(.some(let service)) = chosenValue(from: sender, current: serviceP),
+              service != serviceP else { return }
         UserDefaults.standard.set(service, forKey: Self.accountPKey)
         rebuildManagers()
     }
 
     @objc private func selectAccountW(_ sender: NSMenuItem) {
-        let service = sender.representedObject as? String
-        guard service != serviceW else { return }
+        guard case .some(let service) = chosenValue(from: sender, current: serviceW),
+              service != serviceW else { return }
         if let service {
             UserDefaults.standard.set(service, forKey: Self.accountWKey)
         } else {

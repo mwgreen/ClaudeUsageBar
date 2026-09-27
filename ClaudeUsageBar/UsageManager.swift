@@ -28,6 +28,39 @@ enum CredentialError: LocalizedError {
     }
 }
 
+/// Failures reported by a remote usage server (usage-server/claude_usage_server.py).
+enum RemoteError: LocalizedError {
+    case notLoggedIn(String)
+    case tokenExpired(String)
+    case unreachable(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notLoggedIn(let message), .tokenExpired(let message), .unreachable(let message):
+            return message
+        }
+    }
+}
+
+/// Where an account's usage comes from. Persisted as a single string per slot:
+/// a Keychain service name, or an http(s) URL of a remote usage server.
+enum AccountSource: Equatable {
+    /// A Claude CLI credential item in this Mac's Keychain.
+    case keychain(service: String)
+    /// A usage server on another host that holds the login itself, so this Mac
+    /// never sees that account's token.
+    case remote(url: URL)
+
+    init(configValue: String) {
+        if let url = URL(string: configValue),
+           let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+            self = .remote(url: url)
+        } else {
+            self = .keychain(service: configValue)
+        }
+    }
+}
+
 @MainActor
 final class UsageManager: ObservableObject {
     @Published var usage: UsageResponse?
@@ -39,16 +72,21 @@ final class UsageManager: ObservableObject {
     /// it) or its access token has expired. The app never refreshes tokens
     /// itself (see `usableCredentials`), so an expired token stays unusable
     /// until the CLI refreshes it, which any `claude` command under that
-    /// profile does; the row returns on the next poll after that.
+    /// profile does; the row returns on the next poll after that. A remote
+    /// account is also hidden while its usage server can't be reached.
     @Published var loggedOutReason: String?
 
     var isLoggedOut: Bool { loggedOutReason != nil }
 
     static let notLoggedInReason = "Not logged in"
     static let tokenExpiredReason = "Token expired \u{2014} run any claude command under this profile to refresh it"
+    static let remoteNotLoggedInReason = "Not logged in on the remote host"
+    static let remoteTokenExpiredReason = "Token expired on the remote host \u{2014} run any claude command there to refresh it"
+    static let remoteUnreachableReason = "Usage server unreachable \u{2014} is the VM running and the tunnel up?"
 
-    /// Keychain service name of the credential item this instance tracks.
+    /// The persisted slot value: a Keychain service name or a remote server URL.
     let service: String
+    let source: AccountSource
 
     private var timer: Timer?
     private let refreshInterval: TimeInterval = 300 // 5 minutes
@@ -64,6 +102,7 @@ final class UsageManager: ObservableObject {
 
     init(service: String) {
         self.service = service
+        self.source = AccountSource(configValue: service)
         Task { [weak self] in
             await self?.refresh()
         }
@@ -80,6 +119,14 @@ final class UsageManager: ObservableObject {
     }
 
     func refresh() async {
+        if case .remote(let url) = source {
+            do {
+                try applySuccessfulFetch(try await fetchRemoteUsage(url: url))
+            } catch {
+                handleFailure(error: error)
+            }
+            return
+        }
         claudeVersion = detectClaudeCodeVersion() ?? "2.0.31"
         do {
             let creds = try usableCredentials()
@@ -200,6 +247,13 @@ final class UsageManager: ObservableObject {
         if let urlError = error as? URLError, urlError.code == .userAuthenticationRequired {
             return Self.tokenExpiredReason
         }
+        if let remoteError = error as? RemoteError {
+            switch remoteError {
+            case .notLoggedIn: return Self.remoteNotLoggedInReason
+            case .tokenExpired: return Self.remoteTokenExpiredReason
+            case .unreachable: return Self.remoteUnreachableReason
+            }
+        }
         return nil
     }
 
@@ -246,6 +300,37 @@ final class UsageManager: ObservableObject {
         }
 
         return data
+    }
+
+    /// Fetches usage from a remote usage server, which answers 200 with the
+    /// usage endpoint's JSON unchanged, or an {"error", "message"} body.
+    private func fetchRemoteUsage(url: URL) async throws -> Data {
+        var request = URLRequest(url: url, timeoutInterval: 30)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError where [.cannotConnectToHost, .networkConnectionLost, .cannotFindHost].contains(error.code) {
+            // Nothing listening: the VM is off, the tunnel is down, or the
+            // server isn't running. Hidden like a logged-out account.
+            throw RemoteError.unreachable(error.localizedDescription)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse, !(200...299).contains(httpResponse.statusCode) else {
+            return data
+        }
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let message = body?["message"] as? String ?? String(data: data, encoding: .utf8) ?? ""
+        switch body?["error"] as? String {
+        case "not_logged_in": throw RemoteError.notLoggedIn(message)
+        case "token_expired": throw RemoteError.tokenExpired(message)
+        case "rate_limited": throw APIError.rateLimited
+        default:
+            if httpResponse.statusCode == 429 { throw APIError.rateLimited }
+            throw APIError.httpError(statusCode: httpResponse.statusCode, body: message)
+        }
     }
 
     // MARK: - Display helpers

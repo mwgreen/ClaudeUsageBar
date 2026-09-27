@@ -1,0 +1,23 @@
+# systemd user unit for claude_usage_server.py. Install on the host that holds
+# the Claude login (see README "Remote accounts"):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp usage-server/claude-usage-server.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-usage-server
+#   sudo loginctl enable-linger "$USER"   # keep it running without a login session
+#
+# ExecStart assumes the repo is cloned at ~/git-repos/ClaudeUsageBar; adjust if not.
+
+[Unit]
+Description=ClaudeUsageBar usage server (serves this host's Claude usage on 127.0.0.1:7103)
+
+[Service]
+ExecStart=/usr/bin/python3 %h/git-repos/ClaudeUsageBar/usage-server/claude_usage_server.py --port 7103
+# So the server can find `claude` for the User-Agent version.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
