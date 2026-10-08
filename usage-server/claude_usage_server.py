@@ -15,7 +15,8 @@ Like the app, it never calls the OAuth token endpoint itself: a refresh from
 here would rotate the refresh token underneath a running CLI session. The CLI
 refreshes its own token whenever it runs, so with --keep-token-fresh the
 server runs one tiny `claude -p` call (Haiku, no saved session) when the
-stored token is expired or about to expire, at most once per 10 minutes, and
+stored token is expired or about to expire, or when the usage API refuses it
+anyway, at most once per 10 minutes, and
 lets the CLI do the refresh. Without it, an expired token answers
 token_expired until any `claude` command on this host has refreshed it.
 
@@ -149,24 +150,41 @@ class UsageSource:
         self._keep_token_fresh = keep_token_fresh
         self._last_nudge = 0.0
 
+    def _can_nudge(self):
+        return self._keep_token_fresh and time.time() - self._last_nudge > NUDGE_RETRY_SECONDS
+
+    def _nudge(self):
+        self._last_nudge = time.time()
+        nudge_cli()
+
     def _access_token(self):
         token, expires = read_credentials()
-        if (self._keep_token_fresh and expires is not None
-                and expires - time.time() < NUDGE_MARGIN_SECONDS
-                and time.time() - self._last_nudge > NUDGE_RETRY_SECONDS):
-            self._last_nudge = time.time()
-            nudge_cli()
+        if (expires is not None and expires - time.time() < NUDGE_MARGIN_SECONDS
+                and self._can_nudge()):
+            self._nudge()
             token, expires = read_credentials()
         if expires is not None and expires <= time.time():
             raise UsageError(503, "token_expired", "stored access token is past its expiry")
         return token
+
+    def _fetch(self):
+        try:
+            return fetch_usage(self._access_token(), self._version.get())
+        except UsageError as e:
+            # The API can refuse a token before its stored expiry (e.g. revoked
+            # server-side); the CLI fixes that the same way, by refreshing.
+            if e.code != "token_expired" or not self._can_nudge():
+                raise
+            log(f"usage {e.code}: {e.message}")
+            self._nudge()
+            return fetch_usage(self._access_token(), self._version.get())
 
     def answer(self):
         with self._lock:
             if self._cached and time.time() - self._cached[0] < CACHE_SECONDS:
                 return self._cached[1:]
             try:
-                body = fetch_usage(self._access_token(), self._version.get())
+                body = self._fetch()
                 result = (200, body)
             except UsageError as e:
                 log(f"usage {e.code}: {e.message}")
