@@ -157,9 +157,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if index > 0 {
                 line.append(separator)
             }
-            line.append(NSAttributedString(string: "\(Int(metric.percent.rounded()))", attributes: [
-                .font: font, .foregroundColor: color(for: metric.percent)
-            ]))
+            if let percent = metric.percent {
+                line.append(NSAttributedString(string: "\(Int(percent.rounded()))", attributes: [
+                    .font: font, .foregroundColor: color(for: percent)
+                ]))
+            } else {
+                line.append(NSAttributedString(string: "\u{2013}", attributes: labelAttrs))
+            }
         }
 
         // Extra-usage ("usage credits") spend, only once some has been used.
@@ -244,16 +248,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if let usage = manager.usage {
-            let h5 = Int(usage.fiveHour.utilization.rounded())
-            let d7 = Int(usage.sevenDay.utilization.rounded())
+            // A window the endpoint reports as null has no line here; the bar
+            // keeps a dash in its column.
+            if let fiveHour = usage.fiveHour {
+                let h5 = Int(fiveHour.utilization.rounded())
+                let h5Item = NSMenuItem(title: "5-hour session: \(h5)% \u{2014} \(manager.relativeReset(from: fiveHour.resetsAt))", action: nil, keyEquivalent: "")
+                h5Item.isEnabled = false
+                menu.addItem(h5Item)
+            }
 
-            let h5Item = NSMenuItem(title: "5-hour session: \(h5)% \u{2014} \(manager.relativeReset(from: usage.fiveHour.resetsAt))", action: nil, keyEquivalent: "")
-            h5Item.isEnabled = false
-            menu.addItem(h5Item)
-
-            let d7Item = NSMenuItem(title: "7-day weekly: \(d7)% \u{2014} \(manager.relativeReset(from: usage.sevenDay.resetsAt))", action: nil, keyEquivalent: "")
-            d7Item.isEnabled = false
-            menu.addItem(d7Item)
+            if let sevenDay = usage.sevenDay {
+                let d7 = Int(sevenDay.utilization.rounded())
+                let d7Item = NSMenuItem(title: "7-day weekly: \(d7)% \u{2014} \(manager.relativeReset(from: sevenDay.resetsAt))", action: nil, keyEquivalent: "")
+                d7Item.isEnabled = false
+                menu.addItem(d7Item)
+            }
 
             if let opus = usage.sevenDayOpus, opus.utilization > 0 {
                 let opusVal = Int(opus.utilization.rounded())

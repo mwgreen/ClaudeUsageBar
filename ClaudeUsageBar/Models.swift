@@ -1,8 +1,10 @@
 import Foundation
 
 struct UsageResponse: Codable {
-    let fiveHour: UsageBucket
-    let sevenDay: UsageBucket
+    /// Either window can be null: the endpoint sends `"five_hour": null` for
+    /// an account whose plan has no 5-hour session window.
+    let fiveHour: UsageBucket?
+    let sevenDay: UsageBucket?
     let sevenDayOpus: UsageBucket?
     let limits: [UsageLimit]?
     let extraUsage: ExtraUsage?

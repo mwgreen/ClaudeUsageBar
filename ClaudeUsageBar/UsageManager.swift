@@ -268,9 +268,9 @@ final class UsageManager: ObservableObject {
                 ? "null"
                 : String(describing: value).replacingOccurrences(of: "\n", with: " ")
         }
-        let fiveHour = Int(decoded.fiveHour.utilization.rounded())
-        let sevenDay = Int(decoded.sevenDay.utilization.rounded())
-        log.notice("[\(self.service, privacy: .public)] usage ok: 5h=\(fiveHour)% 7d=\(sevenDay)% extra_usage=\(extraDescription, privacy: .public)")
+        let fiveHour = decoded.fiveHour.map { "\(Int($0.utilization.rounded()))%" } ?? "null"
+        let sevenDay = decoded.sevenDay.map { "\(Int($0.utilization.rounded()))%" } ?? "null"
+        log.notice("[\(self.service, privacy: .public)] usage ok: 5h=\(fiveHour, privacy: .public) 7d=\(sevenDay, privacy: .public) extra_usage=\(extraDescription, privacy: .public)")
     }
 
     private func fetchUsage(token: String) async throws -> Data {
@@ -337,7 +337,9 @@ final class UsageManager: ObservableObject {
 
     struct Metric {
         let name: String
-        let percent: Double
+        /// Nil when the endpoint reports the window as null for this account;
+        /// drawn as a dash so the 5h · 7d · model columns keep their places.
+        let percent: Double?
         let resetsAt: String?
     }
 
@@ -346,8 +348,8 @@ final class UsageManager: ObservableObject {
     var metrics: [Metric] {
         guard let usage else { return [] }
         var out = [
-            Metric(name: "5h", percent: usage.fiveHour.utilization, resetsAt: usage.fiveHour.resetsAt),
-            Metric(name: "7d", percent: usage.sevenDay.utilization, resetsAt: usage.sevenDay.resetsAt)
+            Metric(name: "5h", percent: usage.fiveHour?.utilization, resetsAt: usage.fiveHour?.resetsAt),
+            Metric(name: "7d", percent: usage.sevenDay?.utilization, resetsAt: usage.sevenDay?.resetsAt)
         ]
         for limit in usage.scopedModelLimits {
             guard let name = limit.scope?.model?.displayName, let percent = limit.percent else { continue }
